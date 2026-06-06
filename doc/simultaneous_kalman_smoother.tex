@@ -1,0 +1,3164 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage[round,authoryear]{natbib}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{graphicx}
+
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  backgroundcolor=\color{gray!5}
+}
+
+\newcommand{\E}{\mathbb E}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+
+\title{The Simultaneous Kalman Smoother:\\
+State Space Models Made Easy}
+\author{%
+Mico Mrkaic\\
+International Monetary Fund\\
+\texttt{mmrkaic@imf.org}%
+\thanks{%
+This note and the accompanying \texttt{simksmoother} software package
+(Octave/MATLAB and Python) were produced under the author's guidance
+and direction, with the assistance of AI (Claude, Anthropic). The
+author is responsible for all content, errors, and omissions.}%
+}
+
+\date{June 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The Kalman filter and the Rauch--Tung--Striebel smoother are usually
+derived through a forward--backward recursion of conditional means and
+covariances.  For economists this derivation is needlessly hard to
+follow.  The recursive form has two original motivations, neither of
+which now applies to us.  First, it was developed for online vehicle
+guidance on 1960s computers with kilobytes of memory, where storing the
+joint distribution of an entire latent path was impossible.  Second, it
+is in the idiom of control engineering --- state machines, predictions,
+online updates --- whereas econometrics is built around joint
+distributions, regressions, and batch data.  This note derives the
+smoother in the idiom that is native to us.  The key observation is
+that stacking the full latent path and all observations produces one
+big multivariate normal vector, and the entire Kalman smoother is just
+the textbook conditional-Gaussian formula applied to that vector.
+Solving the resulting system in precision form is one sparse
+block-tridiagonal linear equation $J\widehat X=h$.  The Kalman filter
+and the RTS smoother are then exposed as the block-LDL$^\top$ forward
+sweep and the selected-inversion backward sweep of the same system ---
+implementation details, not theory.  Posterior covariances, marginal
+likelihood, missing data, diffuse priors, EM, the Hodrick--Prescott
+filter, and exogenous inputs all become small edits to $J$ and $h$.
+Heavy-tailed disturbances (Student-$t$, Laplace, Huber) become
+iteratively reweighted versions of the same sparse solve, and the
+framework extends cleanly to regime-switching dynamics (variational
+EM on the same $J$) and to inequality-constrained smoothing
+(interior-point QP on the same $J$).  The precision-based view is not
+new; it appears in spatial statistics and Bayesian econometrics as
+the ``Gaussian Markov random field'' view of state space.  It is,
+however, considerably easier to teach.
+\end{abstract}
+
+\section{An Example to Motivate the Discussion}
+\label{sec:motivation}
+
+Most economists meet the Hodrick--Prescott filter as a recipe: to
+extract a trend $\tau_t$ from a series $y_t$, solve
+\begin{equation}
+\min_{\tau_1,\dots,\tau_T}\ \sum_{t=1}^{T}(y_t-\tau_t)^2
+   + \lambda \sum_{t=2}^{T-1}\bigl[(\tau_{t+1}-\tau_t)-(\tau_t-\tau_{t-1})\bigr]^2,
+\label{eq:hp-recipe}
+\end{equation}
+with $\lambda=1600$ for quarterly data, and read off $\widehat\tau$.
+The first sum keeps the trend close to the data; the second penalizes
+changes in the slope of the trend, with $\lambda$ governing how hard.
+Most users stop there.  But where does this objective come from, what
+model does it correspond to, and what is $\lambda$, really?  Answering
+those questions is the cleanest possible introduction to everything in
+this note, because the HP filter turns out to be a one-line state-space
+model, and \eqref{eq:hp-recipe} turns out to be a conditional
+expectation in a multivariate normal.  Once that is clear, a whole
+catalogue of extensions opens up almost for free.
+
+\subsection{The HP filter is a state-space model}
+
+Write potential output $\tau_t$ as a latent process whose
+\emph{second difference} is white noise, and observed output $y_t$ as
+potential plus a transitory gap:
+\begin{align}
+(\tau_{t+1}-\tau_t)-(\tau_t-\tau_{t-1}) &= e_t, & e_t &\sim N(0,\sigma_e^2),
+\label{eq:hp-state}\\
+y_t &= \tau_t + \varepsilon_t, & \varepsilon_t &\sim N(0,\sigma_\varepsilon^2).
+\label{eq:hp-meas}
+\end{align}
+Equation~\eqref{eq:hp-state} is the economic content of the HP filter,
+usually left implicit: \emph{potential output is an $I(2)$ process}.
+Its level is non-stationary, its growth rate $g_t\equiv\tau_t-\tau_{t-1}$
+is non-stationary, but the \emph{change} in its growth rate is
+unforecastable noise.  Equation~\eqref{eq:hp-meas} is the trend--cycle
+decomposition: the part of output we observe is potential plus a
+transitory deviation $\varepsilon_t$, the ``output gap'' up to sign.
+
+This is already a useful step, independent of anything that follows.
+The recipe \eqref{eq:hp-recipe} hides a strong, testable economic
+assumption --- that potential output is $I(2)$ --- behind a smoothing
+objective.  Writing the model in the form \eqref{eq:hp-state}--\eqref{eq:hp-meas}
+makes the assumption explicit, and immediately invites the question of
+whether it is the right one for a given series.  If potential growth
+is better described as \emph{stationary} ($I(1)$ in the level) rather
+than as a driftless random walk ($I(2)$ in the level), the HP filter is
+misspecified, and one would want a different state equation.  One cannot
+even ask that question from the recipe alone.
+
+\subsection{Where \texorpdfstring{$\lambda$}{lambda} comes from}
+
+The two innovation variances are not separately identified by the
+\emph{shape} of the extracted trend --- only their ratio is.  To see
+this, write the joint Gaussian log-density of the latent path and the
+data implied by \eqref{eq:hp-state}--\eqref{eq:hp-meas}.  Dropping
+constants, minimizing $-2\log p$ over $\tau$ gives
+\begin{equation}
+\min_{\tau}\ \frac{1}{\sigma_\varepsilon^2}\sum_{t=1}^{T}(y_t-\tau_t)^2
+   + \frac{1}{\sigma_e^2}\sum_{t=2}^{T-1}\bigl[(\tau_{t+1}-\tau_t)-(\tau_t-\tau_{t-1})\bigr]^2.
+\label{eq:hp-mle}
+\end{equation}
+Multiplying through by $\sigma_\varepsilon^2$ leaves the minimizer
+unchanged and produces \eqref{eq:hp-recipe} exactly, with
+\begin{equation}
+\boxed{\ \lambda=\frac{\sigma_\varepsilon^2}{\sigma_e^2}.\ }
+\label{eq:lambda}
+\end{equation}
+So $\lambda$ is not a free smoothing knob: it is the ratio of the
+measurement-noise variance to the trend-innovation variance.  The
+famous value $\lambda=1600$ for quarterly data is an assertion that the
+transitory component of output is $1600$ times as variable as the
+shocks to trend growth.  Stated that way, it is a falsifiable claim
+about the data, not a tuning choice --- and indeed $\sigma_\varepsilon^2$
+and $\sigma_e^2$ can be estimated by maximum likelihood rather than
+assumed, which is one of the extensions below.
+
+\subsection{The same problem in simultaneous form}
+
+Now stack.  Collect the trend into $\bm\tau=(\tau_1,\dots,\tau_T)'$ and
+the data into $\bm y=(y_1,\dots,y_T)'$.  The measurement
+equation~\eqref{eq:hp-meas} stacks to
+\begin{equation}
+\bm y = \bm\tau + \bm\varepsilon, \qquad \bm\varepsilon\sim N(0,\sigma_\varepsilon^2 I_T).
+\label{eq:hp-meas-stacked}
+\end{equation}
+The state equation~\eqref{eq:hp-state} is a statement about the second
+difference of $\bm\tau$.  Let $D_2$ be the $(T-2)\times T$
+second-difference operator, the matrix whose $t$-th row places
+$(1,-2,1)$ in columns $t,t+1,t+2$:
+\begin{equation}
+D_2=\begin{pmatrix}
+1 & -2 & 1 & & \\
+  & 1 & -2 & 1 & \\
+  &   & \ddots & \ddots & \ddots \\
+\end{pmatrix},
+\qquad
+D_2\bm\tau = \bm e,\quad \bm e\sim N(0,\sigma_e^2 I_{T-2}).
+\label{eq:hp-state-stacked}
+\end{equation}
+Both \eqref{eq:hp-meas-stacked} and \eqref{eq:hp-state-stacked} are
+linear in $\bm\tau$ with Gaussian right-hand sides.  Reading off the
+pieces, $\bm\tau$ has prior precision $\sigma_e^{-2}D_2'D_2$ (this is
+what the $I(2)$ assumption contributes), and the data contributes
+measurement precision $\sigma_\varepsilon^{-2}I_T$.  One qualification
+is needed: $D_2'D_2$ has rank $T-2$, so the prior on $\bm\tau$ is an
+\emph{intrinsic} (improper) Gaussian --- it is flat in the two
+directions spanned by the initial level and slope of the trend, the
+diffuse-limit prior on those components.  Strictly, then,
+$(\bm\tau,\bm y)$ is jointly Gaussian in the intrinsic/improper sense
+rather than a proper multivariate normal.  None of what follows is
+affected: the \emph{posterior} of $\bm\tau$ given $\bm y$ is a proper
+Gaussian, because the measurement term adds the full-rank precision
+$\sigma_\varepsilon^{-2}I_T$.
+
+The trend we want is the conditional expectation $\E[\bm\tau\mid\bm y]$,
+which for a multivariate normal is the familiar Bayesian-GLS / ridge
+estimator.  Equivalently it is the mode, which solves the
+penalized least-squares problem obtained by stacking
+\eqref{eq:hp-meas-stacked}--\eqref{eq:hp-state-stacked}:
+\begin{equation}
+\widehat{\bm\tau}
+=\E[\bm\tau\mid\bm y]
+=\argmin_{\bm\tau}\ \frac{1}{\sigma_\varepsilon^2}\|\bm y-\bm\tau\|^2
+   + \frac{1}{\sigma_e^2}\|D_2\bm\tau\|^2 .
+\label{eq:hp-pls-motiv}
+\end{equation}
+Differentiating and setting the gradient to zero gives a single linear
+system,
+\begin{equation}
+\underbrace{\Bigl(I_T+\lambda\,D_2'D_2\Bigr)}_{J}\,\widehat{\bm\tau}
+   = \underbrace{\bm y}_{h},
+\qquad \lambda=\frac{\sigma_\varepsilon^2}{\sigma_e^2},
+\label{eq:hp-linsys}
+\end{equation}
+where we divided through by $\sigma_\varepsilon^{-2}$ so that only the
+ratio $\lambda$ appears.  This is the closed-form HP solution
+$\widehat{\bm\tau}=(I+\lambda D_2'D_2)^{-1}\bm y$ that appears in every
+reference --- but now we have \emph{derived} it, as the conditional mean
+of a multivariate normal, rather than posited it as an objective.
+
+Three things are worth pausing on, because they are the whole note in
+miniature.
+
+\emph{First}, the matrix $J=I+\lambda D_2'D_2$ is \emph{banded}: $D_2$
+has bandwidth two, so $D_2'D_2$ is pentadiagonal and $J$ is pentadiagonal.
+Solving \eqref{eq:hp-linsys} by a banded Cholesky factorization costs
+$O(T)$ operations and $O(T)$ storage, not the $O(T^3)$ a dense
+$(I+\lambda D_2'D_2)^{-1}$ would suggest.  The sparsity is not an
+accident of the HP filter; it is the stacked image of the fact that
+$\tau_t$ interacts only with its near neighbours in time, and it is
+exactly the structure that makes the general simultaneous smoother of
+this note cheap.
+
+\emph{Second}, the recipe and the model are now visibly the same object.
+The HP ``smoothing parameter'' is a variance ratio; the ``smoothing
+penalty'' is the $I(2)$ prior; the ``filter'' is a conditional
+expectation in a Gaussian.  No forward pass, no backward pass, no
+Kalman gain --- just $J\widehat{\bm\tau}=h$, one sparse solve.
+
+\emph{Third}, and most important for what follows, this derivation
+generalizes immediately.  We made no use of the specific structure of
+the HP filter beyond ``the latent path is constrained by a linear
+Gaussian state equation, and the data is a linear Gaussian readout of
+the state.''  Any linear Gaussian state-space model has that form, so
+any such model reduces to a sparse linear system $J\widehat X=h$ in
+exactly the same way.  The rest of this note works out the general
+case.
+
+\subsection{What this buys us}
+
+Because the HP filter is now an instance of one Gaussian conditioning
+problem rather than a standalone recipe, extensions that would each
+require their own derivation in the recursive idiom become small,
+composable edits to $J$ and $h$.  A few that we develop later, each
+already meaningful for the trend--cycle decomposition above:
+
+\begin{itemize}[leftmargin=2em,itemsep=4pt]
+
+\item \textbf{Exogenous drivers.}  Suppose a credit gap or a terms-of-trade
+index $z_t$ shifts trend growth.  Add $\beta z_t$ to the state
+equation~\eqref{eq:hp-state} or $\gamma z_t$ to the
+measurement~\eqref{eq:hp-meas}.  In simultaneous form this leaves $J$
+\emph{unchanged} and only shifts $h$ by a deterministic offset
+(Section~\ref{sec:model}).  The smoothed trend then decomposes
+additively into a ``pure HP'' part and a credit-driven part.
+
+\item \textbf{Sign and shape constraints.}  Suppose we want to impose
+that potential \emph{growth} never turns negative, $g_t=\tau_t-\tau_{t-1}\ge 0$,
+or that a NAIRU-like latent process stays non-negative.  In the recursive
+form there is no clean way to do this; the Kalman recursion produces an
+unconstrained Gaussian.  In simultaneous form it is a single
+inequality-constrained quadratic program with the \emph{same} sparse
+$J$ as its Hessian, solved by an interior-point method
+(Section~\ref{sec:constrained}).
+
+\item \textbf{Estimating $\lambda$ instead of asserting it.}  Since
+$\lambda=\sigma_\varepsilon^2/\sigma_e^2$ is a likelihood parameter, we
+can estimate it --- and hence let the data choose the degree of
+smoothing --- by maximizing the marginal likelihood, which the
+simultaneous form computes from the same factorization of $J$ that
+delivers the trend (Sections~\ref{sec:loglik} and \ref{sec:em}).
+
+\item \textbf{Robustness to outliers and breaks.}  A one-off oil shock
+or a pandemic quarter is a fat-tailed measurement error; a structural
+break is a fat-tailed trend innovation.  Replacing the Gaussian errors
+with Student-$t$ errors turns \eqref{eq:hp-pls-motiv} into an
+iteratively-reweighted version of the same sparse solve
+(Section~\ref{sec:robust}), down-weighting the offending observations
+automatically.
+
+\item \textbf{Honest uncertainty bands.}  The conditional \emph{variance}
+$\Var[\bm\tau\mid\bm y]$ gives pointwise error bands on the trend.  In
+the normalization of \eqref{eq:hp-linsys}, where $J=I+\lambda D_2'D_2$
+after dividing through by $\sigma_\varepsilon^{-2}$, the posterior
+covariance is $\Var[\bm\tau\mid\bm y]=\sigma_\varepsilon^2 J^{-1}$ ---
+the measurement-noise scale multiplies the normalized inverse (only if
+one imposes $\sigma_\varepsilon^2=1$ is it $J^{-1}$ itself).  The
+scale does not affect the smoothed trend, but it does set the width of
+the bands.  These widen automatically where data is
+missing and narrow where it is dense, and they are computed without
+forming the dense inverse, by a sparse selected-inversion recursion
+(Section~\ref{sec:selinv}).
+
+\end{itemize}
+
+Every one of these is a small modification of the same object
+$J\widehat X=h$.  None requires a new filter, a new backward pass, or a
+re-derived boundary condition.  This composability --- many extensions,
+one sparse linear system --- is the practical case for the simultaneous
+formulation, on top of the formulation being, in our experience, much
+easier to understand.  The remainder of the note makes the general
+construction precise and then returns, in the worked applications of
+Appendix~\ref{sec:apps}, to exactly the kind of trend--cycle problem
+this section started with.
+
+\section{A More Intuitive Way to Derive the Kalman Filter}
+
+The Kalman filter and the Rauch--Tung--Striebel (RTS) smoother\footnote{Often
+called simply the ``Kalman smoother'' in economics texts.  We retain the
+RTS terminology to keep the filter and smoother distinct.} as they appear
+in econometrics textbooks descend, almost unaltered, from \citet{Kalman1960}
+and from \citet{RTS1965}.  Those papers solved a specific engineering
+problem: online estimation of the state of a vehicle from a stream of
+noisy sensor readings, on hardware with kilobytes of memory.  Two
+constraints shaped the derivation.
+
+First, the problem was \emph{online} --- meaning it had to be solved in
+real time.  A new measurement arrived at each instant and the estimate
+had to be updated immediately, without revisiting the past.  A forward
+recursion of conditional moments is the right object for that setting;
+it is what you would invent if you had to.
+
+Second, the hardware could not store the past.  RAM was scarce and
+expensive --- the Apollo Guidance Computer, designed around the same
+time, had two kilobytes of erasable memory.  Holding the joint
+distribution of an entire latent path was inconceivable.  The forward
+recursion was not just elegant; it was the only thing that fit.  The
+RTS smoother of 1965 added a single backward pass for the same reason:
+a second forward sweep would have required storing more than the memory
+budget allowed.
+
+Neither constraint binds in modern macroeconometrics.  We are not doing
+online state estimation on a missile.  We have a batch of data, on disk,
+and we want the smoothed path, the parameters, posterior bands, and the
+marginal likelihood jointly, in one shot.  A laptop holds gigabytes; the
+joint precision matrix\footnote{Throughout the note the \emph{precision
+matrix} of a Gaussian random vector means the inverse of its
+variance--covariance matrix.  Econometrics typically works with
+covariances directly; the precision form is what makes the sparsity of
+state-space models visible and the solves fast, since the inverse of a
+dense covariance can be a sparse matrix and vice versa.} for a model
+with $n=20$ states and $T=200$ has on the order of $1.6\times 10^5$
+nonzeros,\footnote{The precision matrix is block tridiagonal with
+$T+1$ diagonal blocks and $T$ off-diagonal blocks, each of size
+$n\times n$.  Counting upper-triangular storage of the symmetric
+matrix, the structural nonzero count is $(T+1)n^2+Tn^2=(2T+1)n^2$;
+for $T=200$ and $n=20$ this gives $401\times 400=160\,400$.}
+which is negligible.
+
+Econometric tradition and methodology differ from those used in
+engineering.  Control engineers think in terms
+of state machines, predictions, and online updates.  Economists think in
+terms of joint distributions, regressions, OLS and GLS, and matrix
+algebra.  The recursive derivation is in the wrong idiom for us.  It
+asks the student to translate econometric questions --- what is the
+posterior mean of $x_t$ given all observations? what is the marginal
+log-likelihood? what changes when an observation is missing? --- into a
+foreign language about filters and predictions, and then translate the
+output back.  The simultaneous derivation does not require this.  It
+lives in the native econometric idiom: stack the latent path and the
+observations into one big multivariate normal vector, and apply the
+standard conditional Gaussian formula.  That formula is, structurally,
+the GLS estimator; every economist already knows it.  Conditional
+moments, regression interpretations, GLS analogies, penalized least
+squares, and likelihood are all visible at a glance.
+
+This is the motivation.  The recursive form is not wrong, and remains
+the right tool for genuine online filtering.  But for the kind of batch
+work that applied macroeconomists actually do, it is needlessly
+indirect, and teaching it as the primary derivation propagates that
+indirectness to each new cohort of students.
+
+The benefits of the simultaneous approach extend well beyond ease of
+understanding.  By placing everything inside one Gaussian conditioning
+problem, it produces a unified framework in which extensions of the
+basic Gaussian Kalman filter --- heavy-tailed disturbances,
+regime-switching dynamics, inequality constraints, missing data,
+diffuse priors, time-varying parameters, exogenous inputs, and EM
+estimation of unknown parameters --- become small edits to the same
+sparse linear system, rather than separate derivations to be
+maintained independently.  This is what makes the framework not just
+easier to teach, but easier to extend in practice.
+
+\subsection{Where the simultaneous formulation is already standard}
+\label{sec:where-used}
+
+Economists' near-universal use of the recursive form is, by a wide
+margin, the historical outlier.  In almost every neighbouring
+discipline that handles latent Gaussian fields at scale, the
+precision-form / simultaneous representation has been the standard
+production tool for years, leveraging the weapons-grade sparse linear
+algebra infrastructure --- CHOLMOD, MUMPS, PaStiX, SuiteSparse,
+Eigen --- that the numerical-analysis community has built over four
+decades.  A non-exhaustive map of where this idiom already lives:
+
+\begin{itemize}[leftmargin=2em,itemsep=4pt]
+
+\item \textbf{Spatial statistics and the INLA ecosystem.}  The
+\emph{integrated nested Laplace approximation} \citep{RueMartinoChopin2009}
+treats spatial, temporal, and spatio-temporal models as Gaussian
+Markov random fields with sparse precision matrices and solves them
+with sparse Cholesky.  R-INLA has been the dominant Bayesian
+inference tool for latent Gaussian models in epidemiology, ecology,
+disease mapping, and spatial econometrics for fifteen years.  The
+underlying engine is exactly the $JX=h$ solve developed here.
+\citet{RueHeld2005} is the canonical reference and motivates the
+representation directly.
+
+\item \textbf{Modern Bayesian samplers.}  When Stan
+\citep{Carpenter2017} runs Hamiltonian Monte Carlo on a state-space
+model with a Gaussian prior over the latent path, the log-density
+and gradient computations are simultaneous-form operations on the
+sparse precision matrix; the autodiff system never sees a
+forward--backward recursion.  Every Stan model with a latent
+Gaussian field is implicitly doing simultaneous-form inference at
+production scale.
+
+\item \textbf{Large Bayesian VARs and big-data macro.}
+\citet{BanburaModugno2014} use an essentially simultaneous EM
+representation for mixed-frequency factor models with arbitrary
+missing-data patterns, precisely because the recursive form does
+not scale gracefully to large panels.  More recent large-BVAR work
+\citep{GiannoneLenzaPrimiceri2015} moves in the same direction:
+once the number of variables exceeds the few-dozen range, the
+precision-form representation is no longer optional.  This is the
+macro setting closest to the present note, and the direction of
+travel in the literature is clear.
+
+\item \textbf{Geophysical data assimilation.}  Operational weather
+prediction at ECMWF and NCEP, ocean reanalysis, and seismic
+inversion all rely on variational data assimilation (\emph{4D-Var}),
+which is structurally the same object as the simultaneous smoother:
+a quadratic penalty on a state trajectory minimized via sparse
+linear solves.  The systems handle state dimensions in the millions
+on dedicated HPC hardware; none of them runs a recursive Kalman
+filter as the production solver.
+
+\item \textbf{Astrostatistics.}  Large-scale Gaussian process
+regression with structured covariances --- satellite-data
+calibration, gravitational-wave detection pipelines at LIGO,
+exoplanet-search likelihood evaluations --- routinely uses
+precision-form representations with sparse Cholesky.  The numerical
+libraries underneath (CHOLMOD, PaStiX, MUMPS, SuperLU) are the same
+ones that any production state-space code would use.
+
+\item \textbf{Image deblurring and structured inverse problems.}  The
+classical Tikhonov regularization of an inverse problem,
+$\min_X \|y-AX\|^2 + \lambda \|LX\|^2$, is structurally identical
+to the simultaneous smoother with $A=\mathcal H$ and $L$ encoding
+the state dynamics.  Production image-processing pipelines (medical
+imaging, satellite imagery) have solved problems in this form for
+decades.
+
+\item \textbf{Computational statistics, broadly.}
+\citet{ChanJeliazkov2009} and \citet{McCauslandMillerPelletier2011}
+are early macro--statistics references for the precision-form
+representation of state-space inference, including efficient
+simulation smoothing for posterior draws.  Both papers benchmark
+the simultaneous form against the recursive form and find the
+former competitive or faster on realistic problem sizes,
+contradicting the folk impression that recursion is the
+high-performance choice.
+
+\end{itemize}
+
+The common thread is that none of these communities runs a
+hand-coded Riccati recursion in user-level code.  They formulate
+the latent-Gaussian inference problem as a sparse linear system and
+hand it to a production-grade sparse linear algebra library.  The
+recursive Kalman filter, viewed from this perspective, is one
+particular factorization scheme --- the block-LDL$^{\top}$ forward
+sweep developed in Section~\ref{sec:LDL} --- that an
+optimizing sparse solver would discover automatically on a
+block-tridiagonal matrix, without needing to be programmed by hand.
+
+What this means for econometric practice is concrete: when one
+calls \texttt{J $\backslash$ h} in Octave or \texttt{spsolve(J,\,h)}
+in SciPy, or invokes any modern sparse-Cholesky routine, one is
+standing on roughly two hundred person-years of work by serious
+numerical analysts --- much of it specifically tuned for the kind
+of structured matrices that arise in state-space problems.  A
+hand-coded recursive Kalman loop in \texttt{.m} or \texttt{.py}
+gets none of that benefit.
+
+A calibrated statement of the numerical trade-off is in order,
+because the recursive-form libraries
+(\texttt{statsmodels.tsa.statespace}, \texttt{KFAS}, EViews,
+Stata's \texttt{sspace}) have had decades of careful engineering
+invested in making the recursive form robust --- square-root
+forms, exact diffuse initializations, Joseph forms, UDU and
+Bierman--Thornton variants \citep{Bierman1977} --- precisely
+because naive Riccati updates can lose symmetry or positive
+definiteness through subtraction of covariance matrices.  Sparse
+Cholesky on $J$ avoids that particular failure mode by
+construction: $J$ is assembled, not propagated, and the
+factorization of an SPD matrix never subtracts covariances.  But
+the precision form is not a free lunch.  It is a
+\emph{normal-equations} representation --- $J$ contains
+$Q^{-1}$, $R^{-1}$, and products such as $F'Q^{-1}F$ --- so its
+conditioning degrades quadratically where a square-root
+(factored) representation degrades linearly, and it requires
+$Q$ and $R$ to be invertible, which models with deterministic
+state components achieve only through explicit regularization
+(Section~\ref{sec:examples} returns to this).  Square-root and
+UDU filters were invented for genuinely ill-conditioned online
+problems and retain documented advantages there.  The claim of
+this note is therefore deliberately scoped: \emph{for well-posed
+batch Gaussian smoothing with an SPD precision matrix} --- which
+covers the textbook econometric use cases --- sparse Cholesky on
+$J$ is a robust, streamlined, and far more teachable coordinate
+frame, with the production sparse-linear-algebra stack behind it,
+not an unconditional numerical replacement for every Kalman
+variant in every regime.
+
+This is the strongest practical case for the simultaneous
+formulation.  The underlying mathematics is identical; the
+recursive form remains a valid factorization scheme with its own
+documented strengths; but for the batch problems this note is
+about, the software stack the rest of computational statistics
+has converged on assumes the simultaneous representation, and
+economists who move to that idiom inherit a numerical
+infrastructure that is far larger, more battle-tested, and faster
+on real hardware than what any individual research code can hope
+to match.
+
+\section{Model}
+\label{sec:model}
+
+Consider the linear Gaussian state-space system
+\begin{align}
+x_t &= F x_{t-1}+ B z_t + w_t,\quad w_t\sim N(0,Q),\quad t=1,\ldots,T,
+\label{eq:state-eq}\\
+y_t &= Hx_t+ D z_t + v_t,\quad v_t\sim N(0,R),\quad t=1,\ldots,T,
+\label{eq:meas-eq}
+\end{align}
+with initial condition
+\begin{equation}
+x_0\sim N(a_0,P_0).
+\end{equation}
+Here $x_t\in\mathbb R^n$ is latent and $y_t\in\mathbb R^m$ is observed.
+The vector $z_t\in\mathbb R^k$ is an observed exogenous input --- a
+deterministic forcing term that enters the state via the loading
+matrix $B$ (size $n\times k$) and the measurement via $D$ (size
+$m\times k$).  Setting $B=0$ and $D=0$ recovers the textbook
+no-exogenous case.
+
+The two equations describe the same two-layer structure that organizes
+all linear state-space modelling.  Equation~\eqref{eq:state-eq} is the
+\emph{state} (or \emph{transition}) equation: the unobserved latent
+vector $x_t$ evolves autoregressively according to $F$, driven by
+exogenous forcing $Bz_t$ and Gaussian innovations $w_t$.
+Equation~\eqref{eq:meas-eq} is the \emph{measurement} (or
+\emph{observation}) equation: the latent state is observed only through
+the linear combination $Hx_t$, contaminated by Gaussian noise $v_t$.
+Many familiar macroeconometric objects fit this template:
+\begin{itemize}[leftmargin=2em,topsep=2pt,itemsep=1pt]
+\item A univariate AR(1) signal observed with noise has $n=m=1$,
+  $F=\phi$, $H=1$;
+\item The Hodrick--Prescott filter has $n=2$, $m=1$, with $F$
+  encoding a trend and a slope component;
+\item A small structural VAR has $n=m$ equal to the number of
+  observed variables, with $H=I$ and $R$ small;
+\item A dynamic factor model has $n\ll m$, with $H$ a tall matrix of
+  factor loadings.
+\end{itemize}
+Section~\ref{sec:examples} works through four cases in full detail ---
+an AR(1) signal in noise, the HP filter, an MA(1) via state
+augmentation, and an HP filter driven by an observed financial cycle
+--- and the worked applications of Appendix~\ref{sec:apps} include a
+structural multi-equation system and a dynamic factor model.
+
+Including exogenous inputs from the outset reflects how state-space
+models are actually used in macroeconometrics: an output gap is
+estimated jointly with the dynamics of a credit cycle, an
+unobserved-components model is augmented with policy variables, a
+factor model carries observed drivers alongside the latent factors.
+The technical apparatus is identical to the no-exogenous case; the
+key observation, made precise in Section~\ref{sec:precision-form}, is that
+$z_t$ leaves the precision matrix $J$ entirely unchanged and only
+shifts the information vector $h$ deterministically.  This is one of
+the cleanest payoffs of the simultaneous formulation: the geometry of
+the smoothing problem is invariant to deterministic forcing.
+
+The goal of smoothing is to estimate the full path
+\begin{equation}
+X=(x_0',x_1',\ldots,x_T')'\in\mathbb R^{(T+1)n}
+\end{equation}
+using all observations $Y=(y_1',\ldots,y_T')'$ and all exogenous inputs
+$Z=(z_1',\ldots,z_T')'$.
+
+\subsection{The state dynamics as one block-bidiagonal system}
+
+Define the stacked innovation vector
+\begin{equation}
+W=\begin{pmatrix}x_0-a_0\\ w_1\\ \vdots\\ w_T\end{pmatrix},
+\qquad
+\Omega=\Var(W)=\diag(P_0,Q,\ldots,Q).
+\end{equation}
+Now define
+\begin{equation}
+G=\begin{pmatrix}
+I & 0 & 0 & \cdots & 0\\
+-F & I & 0 & \cdots & 0\\
+0 & -F & I & \ddots & \vdots\\
+\vdots & \ddots & \ddots & \ddots & 0\\
+0 & 0 & \cdots & -F & I
+\end{pmatrix},
+\qquad
+c_W=\begin{pmatrix}a_0\\ Bz_1\\ Bz_2\\ \vdots\\ Bz_T\end{pmatrix}.
+\end{equation}
+The vector $c_W$ collects two things: the prior mean $a_0$ in the
+top block, and the deterministic exogenous contributions $Bz_t$ to
+each state transition.  With $B=0$ the exogenous blocks vanish and we
+recover the no-exogenous case.
+Then the full state evolution is simply
+\begin{equation}
+GX-c_W=W,\qquad W\sim N(0,\Omega).
+\label{eq:dyn}
+\end{equation}
+This is the first key simplification.  The dynamics are not a mysterious
+recursion.  They are one sparse linear equation.
+
+\subsubsection{Nilpotent-shift representation}
+
+Let $S_{\downarrow}$ be the lower shift matrix with ones on the first
+subdiagonal.  Then
+\begin{equation}
+G=I_{T+1}\otimes I_n-S_{\downarrow}\otimes F.
+\end{equation}
+The intuition behind this Kronecker decomposition is that $G$ is the
+identity minus a one-step-delay shift weighted by $F$: the diagonal of
+$G$ holds the identity on each $x_t$, and the subdiagonal applies
+$-F$ to map $x_{t-1}$ to its contribution in the $t$-th equation.
+Powers of $S_{\downarrow}$ shift down by more positions, and
+$S_{\downarrow}^{T+1}=0$ because one cannot shift further than the
+horizon $T+1$.  The Neumann series for $G^{-1}$ therefore terminates
+at order $T$:
+\begin{equation}
+G^{-1}=\sum_{k=0}^{T} S_{\downarrow}^k\otimes F^k.
+\end{equation}
+The $(t,s)$ block of $G^{-1}$ is therefore
+\begin{equation}
+(G^{-1})_{ts}=\begin{cases}F^{t-s},&t\ge s,\\0,&t<s.\end{cases}
+\end{equation}
+This matrix is the explicit propagation operator: shocks are pushed
+forward by powers of $F$, and the lower-triangular block structure
+encodes the causal arrow of time.
+
+\subsection{The measurement equation}
+
+Stack observations and exogenous inputs as
+\begin{equation}
+Y=\begin{pmatrix}y_1\\ \vdots\\ y_T\end{pmatrix},
+\qquad
+Z=\begin{pmatrix}z_1\\ \vdots\\ z_T\end{pmatrix}.
+\end{equation}
+Define
+\begin{equation}
+\mathcal H=\begin{pmatrix}
+0 & H & 0 & \cdots & 0\\
+0 & 0 & H & \cdots & 0\\
+\vdots & \vdots & \vdots & \ddots & \vdots\\
+0 & 0 & 0 & \cdots & H
+\end{pmatrix},\qquad
+\mathcal D=\diag(D,D,\ldots,D),\qquad
+\Sigma=I_T\otimes R.
+\end{equation}
+Then
+\begin{equation}
+Y=\mathcal HX+\mathcal D Z+V,\qquad V\sim N(0,\Sigma).
+\label{eq:meas}
+\end{equation}
+The first block-column of $\mathcal H$ is identically zero: $x_0$ never
+enters any observation equation, since measurements run from $t=1$.
+The initial state is constrained only by the prior $x_0\sim N(a_0,P_0)$,
+which contributes the $P_0^{-1}$ term to the top-left block $J_{00}$ of
+the precision matrix.  No $H'R^{-1}H$ term ever lands there.
+
+\subsection{The stacked model as one big multivariate normal}
+\label{sec:mvn}
+
+We now have the entire model in two lines:
+\begin{align}
+GX-c_W &= W,\\
+Y - \mathcal HX - \mathcal D Z &= V,
+\end{align}
+with $W\sim N(0,\Omega)$, $V\sim N(0,\Sigma)$, and $W$ independent of $V$.
+Both equations are linear, and the right-hand sides are jointly Gaussian.
+The exogenous input $Z$ is observed and deterministic, so it enters only
+through means and not variances.  Therefore $(X,Y)$ is itself a
+multivariate normal vector of dimension $(T+1)n+Tm$, and its mean and
+covariance follow by inspection.
+
+The marginal mean of $X$ is the deterministic propagation of the initial
+mean and the exogenous forcing,
+\begin{equation}
+a=\E X=G^{-1}c_W,
+\qquad\text{i.e.}\qquad a_t=F^t a_0+\sum_{s=1}^{t} F^{t-s} B z_s,\ t=0,\ldots,T.
+\end{equation}
+The first term is the textbook propagation; the second is the
+controllability-style integral that maps the exogenous history into the
+state-mean path.  The marginal covariance of $X$ is the same as in the
+no-exogenous case,
+\begin{equation}
+\Sigma_X=\Var X=G^{-1}\Omega G^{-\top},
+\end{equation}
+because $Z$ is observed and deterministic, so it contributes only to
+the mean.
+The joint mean and covariance of $(X,Y)$ are then
+\begin{equation}
+\E\begin{pmatrix}X\\Y\end{pmatrix}=\begin{pmatrix}a\\ \mathcal H a+\mathcal D Z\end{pmatrix},
+\quad
+\Var\begin{pmatrix}X\\Y\end{pmatrix}=
+\begin{pmatrix}\Sigma_X & \Sigma_X\mathcal H^\top\\
+\mathcal H\Sigma_X & \mathcal H\Sigma_X\mathcal H^\top+\Sigma\end{pmatrix}.
+\label{eq:joint}
+\end{equation}
+The covariance is identical to the no-exogenous case; only the mean
+acquires the deterministic offset from $Z$.  That is the whole model.
+
+It is worth pausing to emphasize: equation~\eqref{eq:joint} is the
+fundamental object of this entire note.  Everything that follows ---
+the Kalman filter, the RTS smoother, the marginal log-likelihood,
+EM, the precision-form sparsity, missing data, diffuse priors,
+robust extensions, regime-switching, constrained smoothing --- is a
+corollary of~\eqref{eq:joint} obtained by applying the standard
+conditional-Gaussian formula or by reorganizing the computation to
+exploit sparsity.  In particular, the usual econometric intuition
+takes over immediately: $X$ is unobserved, $Y$ is observed, and the
+operation that recovers the unobserved variable is regression of
+$X$ on $Y$.  Carrying out that regression on the joint normal
+in~\eqref{eq:joint} is precisely what produces the Kalman smoother
+in the next subsection.
+
+\subsubsection{Four examples to ground the abstraction}
+\label{sec:examples}
+
+Before applying the conditioning formula, four classical models make
+the abstract $G$, $\Omega$, $\mathcal H$, $\Sigma$ concrete.  Each is a
+textbook state-space system written first in its conventional
+recursive form and then in our stacked matrix form.  The mapping is
+mechanical: pick $F,H,Q,R$ from the recursive equations, and the four
+big matrices follow.
+
+\paragraph{Example 1: AR(1) signal plus noise.}
+
+The simplest non-trivial state-space model is a scalar AR(1) latent
+process observed with noise,
+\begin{align}
+x_t &= \phi x_{t-1}+w_t,
+        \quad w_t\sim N(0,\sigma_w^2),\\
+y_t &= x_t+v_t,
+        \quad v_t\sim N(0,\sigma_v^2).
+\end{align}
+All four state-space matrices are scalars: $F=\phi$, $H=1$,
+$Q=\sigma_w^2$, $R=\sigma_v^2$.  The dynamics matrix is bidiagonal and
+the measurement matrix is a shift of the identity:
+\begin{equation}
+G=\begin{pmatrix}
+1 & 0 & 0 & \cdots & 0\\
+-\phi & 1 & 0 & \cdots & 0\\
+0 & -\phi & 1 & \ddots & \vdots\\
+\vdots & \ddots & \ddots & \ddots & 0\\
+0 & 0 & \cdots & -\phi & 1
+\end{pmatrix},
+\quad
+\mathcal H=\begin{pmatrix}
+0 & 1 & 0 & \cdots & 0\\
+0 & 0 & 1 & \cdots & 0\\
+\vdots & \vdots & \vdots & \ddots & \vdots\\
+0 & 0 & 0 & \cdots & 1
+\end{pmatrix},
+\end{equation}
+with $\Omega=\diag(P_0,\sigma_w^2,\ldots,\sigma_w^2)$ and
+$\Sigma=\sigma_v^2 I_T$.
+
+It is worth working through how the precision matrix arises from the
+covariance in this scalar case --- the same logic applies in every
+later example, just with $n\times n$ blocks instead of scalars.  From
+$X = G^{-1}(W + \text{const})$ the marginal covariance of $X$ is
+$\Sigma_X = G^{-1}\Omega G^{-\top}$, which is dense (it is the
+classical lag-correlation matrix of an AR(1) plus a top-corner term
+from the prior).  Its inverse, however, is sparse:
+\begin{equation}
+\Sigma_X^{-1} = G^\top\Omega^{-1} G,
+\label{eq:precision-from-cov}
+\end{equation}
+and since $G$ is bidiagonal and $\Omega^{-1}$ is diagonal, the product
+$G^\top\Omega^{-1}G$ is tridiagonal.  Adding $\mathcal H^\top\Sigma^{-1}\mathcal H$,
+which is itself diagonal because measurements do not couple
+periods, gives
+\begin{equation}
+J = G^\top\Omega^{-1}G + \mathcal H^\top\Sigma^{-1}\mathcal H.
+\end{equation}
+Carrying out the multiplication block by block yields the explicit
+form
+\begin{equation}
+J=\begin{pmatrix}
+P_0^{-1}+\tfrac{\phi^2}{\sigma_w^2} & -\tfrac{\phi}{\sigma_w^2} & & & \\
+-\tfrac{\phi}{\sigma_w^2} & \tfrac{1+\phi^2}{\sigma_w^2}+\tfrac{1}{\sigma_v^2} & -\tfrac{\phi}{\sigma_w^2} & & \\
+ & \ddots & \ddots & \ddots & \\
+ & & -\tfrac{\phi}{\sigma_w^2} & \tfrac{1+\phi^2}{\sigma_w^2}+\tfrac{1}{\sigma_v^2} & -\tfrac{\phi}{\sigma_w^2}\\
+ & & & -\tfrac{\phi}{\sigma_w^2} & \tfrac{1}{\sigma_w^2}+\tfrac{1}{\sigma_v^2}
+\end{pmatrix},
+\end{equation}
+with right-hand side $h_0=P_0^{-1}a_0$ and
+$h_t=y_t/\sigma_v^2$ for $t\ge 1$.  The smoother is a single
+tridiagonal solve, which is what Thomas's algorithm or the Kalman
+filter does in this case.  Each diagonal entry has a clear
+interpretation: the prior precision plus the precision of the
+incoming and outgoing innovations plus the measurement precision.
+Smoothing is exactly penalized least squares with state innovations
+penalized at scale $1/\sigma_w^2$ and measurement residuals at scale
+$1/\sigma_v^2$.  The familiar Kalman smoother formulas drop out of
+this tridiagonal solve.
+
+The general lesson: a dense covariance does not mean a dense
+calculation, because the inverse of a dense covariance can be a sparse
+precision and vice versa.  Equation~\eqref{eq:precision-from-cov} is
+the algebraic fact that makes the simultaneous formulation
+computationally attractive.
+
+\paragraph{Example 2: the Hodrick--Prescott filter.}
+
+The HP filter has a two-dimensional latent state: the trend level
+$\tau_t$ and its slope $\Delta\tau_t$.  The recursive form is
+\begin{align}
+\tau_t        &= \tau_{t-1}+\Delta\tau_{t-1},\\
+\Delta\tau_t  &= \Delta\tau_{t-1}+e_t,\quad e_t\sim N(0,1/\lambda),\\
+y_t           &= \tau_t+v_t,\qquad v_t\sim N(0,1).
+\end{align}
+
+Before turning to the state-space matrices, it is worth substituting
+through the recursion to see what economic content this puts on the
+trend.  From the first equation, $\tau_t-\tau_{t-1}=\Delta\tau_{t-1}$;
+applying the same identity at $t-1$ gives
+$\tau_{t-1}-\tau_{t-2}=\Delta\tau_{t-2}$.  Subtracting,
+\begin{equation}
+\Delta^2\tau_t \;=\; (\tau_t-\tau_{t-1})-(\tau_{t-1}-\tau_{t-2})
+\;=\; \Delta\tau_{t-1}-\Delta\tau_{t-2}
+\;=\; e_{t-1} \;\sim\; N(0,\,1/\lambda).
+\end{equation}
+In other words, the HP filter is the maximum-likelihood smoother for
+a model in which the \emph{second difference} of the trend is iid
+Gaussian.  When the observed series is interpreted as log output,
+this means the HP model assumes that potential log GDP is $I(2)$:
+the trend itself is not stationary, its first difference (trend
+growth) is not stationary, but the second difference (the change in
+trend growth) is white noise.  This is a strong and testable
+economic assumption, and it is the right vantage point from which to
+ask whether the HP filter is the right model for a given series ---
+if the data suggest that potential GDP growth itself is stationary
+($I(1)$ rather than $I(2)$ in level), the HP model is misspecified.
+
+With state $x_t=(\tau_t,\Delta\tau_t)^\top$ (dimension $n=2$), the
+state-space matrices are
+\begin{equation}
+F=\begin{pmatrix}1 & 1\\ 0 & 1\end{pmatrix},
+\quad
+H=\begin{pmatrix}1 & 0\end{pmatrix},
+\quad
+Q=\begin{pmatrix}\varepsilon & 0\\ 0 & 1/\lambda\end{pmatrix},
+\quad
+R=1,
+\end{equation}
+where $\varepsilon>0$ is a tiny regularizer on the level dimension of
+$Q$.  This deserves a comment, because it has caused confusion in
+practice.  The HP model genuinely has \emph{zero} innovation on the
+level component --- $\tau_t$ is determined exactly by $\tau_{t-1}$ and
+the slope $\Delta\tau_{t-1}$, with no own shock --- so the natural $Q$
+is $\diag(0,1/\lambda)$, singular.  Whether singular $Q$ is a problem
+depends on which representation of the smoother one uses.
+
+In the conditioning form, equations~\eqref{eq:smooth-mean}--\eqref{eq:smooth-cov},
+the only matrices that need inverting are $P_0$ and $\mathcal H\Sigma_X
+\mathcal H^\top+\Sigma$.  Neither requires $Q^{-1}$; the joint
+distribution~\eqref{eq:joint} is perfectly well-defined when $Q$ is
+singular, since $\Sigma_X=G^{-1}\Omega G^{-\top}$ exists whether or not
+$\Omega$ is invertible.  In this representation, $\varepsilon$ is not
+needed.
+
+In the \emph{precision} form (Section~\ref{sec:precision-form} below),
+we work with $J=G^\top\Omega^{-1}G+\mathcal H^\top\Sigma^{-1}\mathcal H$,
+which requires $\Omega^{-1}$ and therefore $Q^{-1}$.  Here the
+$\varepsilon>0$ is needed --- not as a modelling assumption, but as a
+numerical device to make $Q$ invertible.  As $\varepsilon\to 0$ the
+precision-form smoother approaches the singular-$Q$ smoother of the
+conditioning form, and in practice any $\varepsilon$ many orders of
+magnitude below $1/\lambda$ is invisible in the smoothed path.
+
+Honesty requires spelling out what the regularizer does and does not
+preserve.  Inserting $\varepsilon$ changes the \emph{model}: the
+precision-form likelihood of Section~\ref{sec:loglik}, the EM bound of
+Section~\ref{sec:em}, and the conditioning of $J$ are those of the
+regularized model, not of the exact degenerate-Gaussian model with
+singular $Q$.  For the smoothed path the difference vanishes as
+$\varepsilon\to 0$; for likelihood values it shows up as a
+$\log\varepsilon$ term in $\log\det\Omega$ that is \emph{constant} in
+the remaining parameters --- so likelihood \emph{ratios}, EM
+monotonicity, and ML estimates of the non-degenerate parameters are
+unaffected so long as $\varepsilon$ is held fixed, but the likelihood
+\emph{level} is that of the regularized model.  Exact alternatives
+exist where the distinction matters: eliminate the deterministic state
+components analytically before assembling $J$ (for the HP filter this
+is precisely the reduction to the trend-only system
+$I+\lambda D_2^\top D_2$ of Section~\ref{sec:motivation}), or write
+the degenerate-Gaussian likelihood with pseudo-determinants on the
+support of $Q$.  The formal statements of this note --- the
+LDL$^\top$/Kalman equivalence, the marginal-likelihood formula, the
+EM monotonicity --- are claims about models with symmetric
+positive-definite $P_0$, $Q$, and $R$; degenerate components are
+handled either exactly, by elimination, or approximately, by an
+explicit regularizer whose role is disclosed.  The recursive
+HP smoother makes the same choice implicitly, hidden inside the
+Riccati recursion; the simultaneous form merely makes the
+regularization visible because $Q^{-1}$ appears in $J$ literally.
+
+The structure of $G$, $\mathcal H$, $\Omega$, $\Sigma$ is the same as
+in Example~1 except that every entry is now a $2\times 2$ block
+instead of a scalar.  The precision matrix $J$ is block tridiagonal
+with $2\times 2$ blocks.  Concentrating out $\Delta\tau_t$ and writing
+the objective in terms of the trend alone, the Gaussian smoothing
+problem becomes
+\begin{equation}
+\min_{\tau}\ \sum_{t=1}^T (y_t-\tau_t)^2
+   + \lambda \sum_{t=3}^{T}(\Delta^2\tau_t)^2,
+\label{eq:hp-pls}
+\end{equation}
+which is the original Hodrick--Prescott penalized least squares with
+smoothing parameter $\lambda$.  (With the convention
+$\Delta^2\tau_t=\tau_t-2\tau_{t-1}+\tau_{t-2}$ adopted above, the
+penalty runs over $t=3,\ldots,T$, so that every term involves only
+$\tau_1,\ldots,\tau_T$; this is the same $T-2$ curvature terms as the
+equivalent indexing $\sum_{t=2}^{T-1}(\tau_{t+1}-2\tau_t+\tau_{t-1})^2$
+used in Section~\ref{sec:motivation}, and matches the second-difference
+operator $D_2^\top D_2$.)  The classical closed-form solution is
+$\widehat\tau=(I+\lambda D_2^\top D_2)^{-1}y$, where $D_2$ is the
+second-difference operator.
+
+This is the general lesson: multi-dimensional state is mechanically
+no harder than the scalar case.  The blocks of $J$ are $n\times n$
+instead of $1\times 1$; the sparsity pattern and the solve are
+identical.  And the HP filter, the Beveridge--Nelson decomposition,
+unobserved-components models, and the textbook state-space problem
+are all the same kind of object --- a quadratic penalty on a latent
+path solved by $J\widehat X=h$.  The simultaneous formulation makes
+that visible.
+
+\paragraph{Example 3: MA(1) via state augmentation.}
+
+The moving-average model
+\begin{equation}
+y_t=\epsilon_t+\theta\epsilon_{t-1},
+\qquad \epsilon_t\sim N(0,\sigma^2),
+\end{equation}
+does not fit our framework directly, because $y_t$ depends on both
+$\epsilon_t$ and $\epsilon_{t-1}$ while our $\mathcal H$ is block
+diagonal in the state.  The textbook fix is to augment the state to
+carry the lagged innovation:
+\begin{equation}
+\label{eq:ma-state}
+x_t=\begin{pmatrix}\epsilon_t\\ \epsilon_{t-1}\end{pmatrix},
+\quad
+F=\begin{pmatrix}0 & 0\\ 1 & 0\end{pmatrix},
+\quad
+H=\begin{pmatrix}1 & \theta\end{pmatrix}.
+\end{equation}
+The dynamics inject the new innovation into the first component and
+shift the previous one into the second:
+$x_t=Fx_{t-1}+(\epsilon_t,0)^\top$, with
+$Q=\diag(\sigma^2,\varepsilon)$ for a small regularizer
+$\varepsilon$.  Measurement is essentially noiseless,
+$R=\varepsilon'$, with a small regularizer for invertibility.
+
+The MA(1) example illustrates a general principle that applies to any
+$\mathrm{ARMA}(p,q)$ process: by augmenting the state to dimension
+$n=\max(p,q+1)$, the process fits the framework with $F$ in companion
+form and $Q$ injecting innovations into the first component.  The
+sparsity of $J$ depends on $n$, not on the order of the moving
+average.  Long-MA processes get compact sparse formulations.  The
+recursive filter applied to this augmented system is exactly what
+econometrics textbooks call ``the Kalman filter for ARMA models''.
+
+A subtle point worth flagging now and resolving later: the augmented
+state in~\eqref{eq:ma-state} is one of many equivalent realizations of
+the same observed MA(1) process.  An MA(1) is identified by the scalar
+$\theta$ alone, but our state representation is identified only up to
+invertible transformations $x_t\mapsto Mx_t$ with corresponding
+adjustments to $F$, $H$, and $Q$.  This rotational ambiguity is
+generic; we return to it systematically in Section~\ref{sec:ident}.
+For now it suffices to note that any sensible estimation procedure ---
+the EM algorithm of Section~\ref{sec:em} in particular --- can only
+identify the observable invariants of $(F,H,Q,R)$, not their entries.
+
+\paragraph{Example 4: HP filter with a financial cycle driver.}
+
+The previous examples had no exogenous inputs.  Now consider an
+applied case where the latent trend in output is pushed by an
+observed financial cycle, say a credit gap $z_t$.  The recursive form
+is
+\begin{align}
+\tau_t        &= \tau_{t-1}+\Delta\tau_{t-1},\\
+\Delta\tau_t  &= \Delta\tau_{t-1}+\beta z_t+e_t,\quad e_t\sim N(0,\sigma_e^2),\\
+y_t           &= \tau_t+\gamma z_t+v_t,\quad v_t\sim N(0,\sigma_v^2),
+\end{align}
+where $\beta$ measures how a credit boom raises the trend growth rate
+of output, and $\gamma$ is a small direct effect of credit on the
+output measurement (a contemporaneous spillover).  The state-space
+matrices are
+\begin{equation}
+F=\begin{pmatrix}1 & 1\\ 0 & 1\end{pmatrix},
+\quad
+H=\begin{pmatrix}1 & 0\end{pmatrix},
+\quad
+B=\begin{pmatrix}0\\ \beta\end{pmatrix},
+\quad
+D=\gamma,
+\end{equation}
+with $Q=\diag(\varepsilon,\sigma_e^2)$ and $R=\sigma_v^2$.  The
+exogenous loading $B$ injects credit-gap shocks into the slope
+equation; $D$ allows a direct effect on the observation.
+
+In the stacked formulation, the dynamics matrix $G$ is unchanged from
+the HP filter case --- it depends only on $F$.  What changes is the
+forcing vector,
+\begin{equation}
+c_W=\begin{pmatrix}a_0\\ Bz_1\\ \vdots\\ Bz_T\end{pmatrix}=
+\begin{pmatrix}a_0\\ (0,\beta z_1)^\top\\ \vdots\\ (0,\beta z_T)^\top\end{pmatrix},
+\end{equation}
+and the measurement equation acquires the offset $\mathcal D Z=\gamma
+(z_1,\ldots,z_T)^\top$.  Conditional on $Z$, the precision matrix $J$
+of the smoothing problem is \emph{exactly} the same block-tridiagonal
+matrix as in the no-exogenous HP filter; only $h$ shifts to absorb
+the deterministic forcing.  The smoothed trend $\widehat\tau_{t\mid T}$
+therefore decomposes additively into the no-exogenous HP trend plus
+the credit-driven contribution.
+
+This is the practical use case the simultaneous formulation handles
+most cleanly.  Coupled with the EM machinery of
+Section~\ref{sec:em}, $\beta$ and $\gamma$ can themselves be
+estimated jointly with $F,H,Q,R$.  The demo
+\texttt{demo\_hp\_credit.m} does exactly that on simulated quarterly
+output data with a structural break and outlier contamination, and is
+the flagship example of the package.
+
+The four examples make the same point.  Once $F,H,Q,R,B,D$ are
+identified from the recursive equations, the abstract framework
+becomes a concrete sparse linear-algebra problem.  Different models
+just have different sparsity patterns in $J$, and the conditional
+Gaussian formula of the next subsection applies to all of them
+uniformly.
+
+\subsection{Smoothing as Gaussian conditioning}
+
+Apply to~\eqref{eq:joint} the textbook formula for the conditional
+distribution of one block of a multivariate normal given another.
+Loosely speaking, what comes out is just a regression --- of the entire
+latent path $X$ on all the observations $Y$, with the prior on $X$
+playing the role of a regularizer.  The formula is
+\begin{equation}
+X\mid Y\sim N\bigl(\mu_{X\mid Y},\,\Sigma_{X\mid Y}\bigr)
+\end{equation}
+with
+\begin{align}
+\mu_{X\mid Y} &= a+\Sigma_X\mathcal H^\top
+   \bigl(\mathcal H\Sigma_X\mathcal H^\top+\Sigma\bigr)^{-1}(Y-\mathcal Ha-\mathcal D Z),
+\label{eq:smooth-mean}\\[2pt]
+\Sigma_{X\mid Y} &= \Sigma_X-\Sigma_X\mathcal H^\top
+   \bigl(\mathcal H\Sigma_X\mathcal H^\top+\Sigma\bigr)^{-1}
+   \mathcal H\Sigma_X.
+\label{eq:smooth-cov}
+\end{align}
+
+That is the Kalman smoother.  There is no recursion, no
+prediction/update split, no forward sweep.  It is exactly the Bayesian
+GLS regression formula every economist learns in the first semester of
+graduate econometrics: read $\mathcal H$ as the regressor matrix, $Y-\mathcal D Z$
+as the regressand (the residual after removing the deterministic
+effect of $Z$), $\Sigma$ as the error covariance, and $\Sigma_X^{-1}$
+as the prior precision on $X$.  The smoothed path $\mu_{X\mid Y}$ is
+the posterior mean of this regression; $\Sigma_{X\mid Y}$ is its
+posterior covariance.  Smoothing the latent state is the same kind of
+object as smoothing the coefficients of a Bayesian regression --- it
+just happens to be a regression on a vector that is very long.
+
+The exogenous input $Z$ enters only via the mean of the regressand,
+not the covariance, because $Z$ is observed and non-random.
+
+Equations~\eqref{eq:smooth-mean}--\eqref{eq:smooth-cov} contain every
+quantity the smoother produces.  Marginal sub-vectors of $\mu_{X\mid Y}$
+are the smoothed states $\widehat x_{t\mid T}$.  Diagonal blocks of
+$\Sigma_{X\mid Y}$ are the smoothed covariances $P_{t\mid T}$.  Adjacent
+off-diagonal blocks are the lag-one covariances $P_{t,t-1\mid T}$ that
+EM requires.  The marginal log-likelihood of $Y$ is read off from
+the marginal Gaussian on the second block, which has mean $\mathcal Ha+\mathcal D Z$
+and covariance $\mathcal H\Sigma_X\mathcal H^\top+\Sigma$.
+
+This is the punch line of the simultaneous formulation: the Kalman
+smoother is a special case of the multivariate normal conditioning
+formula.  Everything that looks complicated in the recursive derivation
+comes from refusing to write the joint distribution down.
+
+\subsubsection{Where each econometric idea sits}
+
+The MVN view turns the rest of this note into a map of standard
+econometric machinery onto one Gaussian conditioning problem.  Five
+items will reappear later as small edits to either the joint
+covariance~\eqref{eq:joint} or the precision matrix $J$ defined in the
+next section.
+\begin{itemize}[leftmargin=2em]
+\item \textbf{GLS.}  Equation~\eqref{eq:smooth-mean} is structurally
+  the Bayesian GLS formula: regressor $\mathcal H$, regressand
+  $Y-\mathcal Ha$, error covariance
+  $\mathcal H\Sigma_X\mathcal H^\top+\Sigma$, prior precision
+  $\Sigma_X^{-1}$.  Smoothing \emph{is} Bayesian GLS for the
+  regression $Y=\mathcal HX+V$ with prior $X\sim N(a,\Sigma_X)$.
+\item \textbf{Marginal log-likelihood.}  The marginal distribution of
+  $Y$ in~\eqref{eq:joint} is Gaussian with mean $\mathcal Ha$ and
+  covariance $\mathcal H\Sigma_X\mathcal H^\top+\Sigma$, so
+  $\log p(Y;\theta)$ is the concentrated GLS criterion: a quadratic
+  plus a log-determinant.  Section~\ref{sec:loglik} computes both
+  terms without forming that dense covariance.
+\item \textbf{Missing data.}  A missing entry of $y_t$ is one row of
+  $\mathcal H$ together with the corresponding row and column of
+  $\Sigma$ dropped.  The joint MVN is still well-defined; the
+  conditional Gaussian still applies.  In precision form
+  (Section~\ref{sec:missing}), this is one term subtracted from the
+  diagonal block $J_{tt}$.
+\item \textbf{Diffuse prior.}  The $P_0^{-1}\to 0$ limit corresponds
+  to a flat prior on $x_0$, equivalently an unbounded marginal
+  variance in $\Sigma_X$.  $X\mid Y$ remains well-defined whenever
+  the observations identify the path.  In precision form
+  (Section~\ref{sec:diffuse}), the prior block of $J$ is simply
+  dropped.
+\item \textbf{EM sufficient statistics.}  The E-step needs
+  $\E[x_t x_t'\mid Y]$ and $\E[x_t x_{t-1}'\mid Y]$.  These are
+  diagonal and adjacent off-diagonal blocks of
+  $\Sigma_{X\mid Y}$ in~\eqref{eq:smooth-cov}, plus outer products
+  of smoothed means; Section~\ref{sec:em} reads them off.
+\end{itemize}
+Each item is the same MVN object viewed through a different
+econometric lens.  The next sections introduce the precision form not
+because it is conceptually different but because it computes these
+same quantities efficiently on a very long Gaussian.
+
+\subsubsection{Why we don't compute estimates directly}
+
+Equations~\eqref{eq:smooth-mean}--\eqref{eq:smooth-cov} are
+mathematically perfect, but evaluating them as written --- with dense
+matrix algebra --- is computationally wasteful.  Three large dense
+objects appear:
+\begin{itemize}[leftmargin=2em]
+\item $\Sigma_X=G^{-1}\Omega G^{-\top}$ is dense, since $G^{-1}$ is
+  lower triangular but full;
+\item $\mathcal H\Sigma_X\mathcal H^\top+\Sigma$ is dense of size
+  $mT\times mT$;
+\item inverting it naively costs $O(m^3T^3)$.
+\end{itemize}
+This is the cost of treating the smoothing problem as a generic
+regression on a vector of length $(T+1)n$.  The next several sections
+show that the same calculation can be organized to exploit the
+state-space structure: although $\Sigma_{X\mid Y}$ is dense, its
+inverse $J=\Sigma_{X\mid Y}^{-1}$ is sparse and block tridiagonal.
+Working with $J$ instead of $\Sigma_{X\mid Y}$ reduces the cost from
+$O(T^3n^3)$ to $O(Tn^3)$.  No new mathematics is involved --- only a
+change of representation that makes the sparsity visible.
+
+\subsection{Identification}
+\label{sec:ident}
+
+Identification is not optional.  For any nonsingular $M$,
+\begin{equation}
+\tilde x_t=Mx_t,
+\qquad
+\tilde F=MFM^{-1},
+\qquad
+\tilde H=HM^{-1},
+\qquad
+\tilde Q=MQM'
+\end{equation}
+produce the same observed process.  Therefore the latent state is only
+identified up to invertible transformations unless restrictions are
+imposed.  Common restrictions include:
+\begin{itemize}[leftmargin=2em]
+\item observed-state normalizations, for example fixing part of $H$ to
+  $[I\;0]$;
+\item factor-model normalizations, such as diagonal or triangular
+  loading matrices;
+\item setting the scale of the latent shocks, for example $Q=I$;
+\item imposing a companion form, zero restrictions, or stability
+  restrictions on $F$;
+\item economic long-run restrictions or sign restrictions.
+\end{itemize}
+
+When comparing estimated $F,H$ to true values, compare \emph{invariants}
+of the latent dynamics (eigenvalues of $F$, achieved log-likelihood, or
+the impulse responses of $y_t$) rather than entries of $F$ and $H$.
+
+\section{The simultaneous smoother in precision form}
+\label{sec:precision-form}
+
+The remainder of this section develops the precision-form
+representation of the smoother in full.  The flow is: posterior
+precision and information vector (\S\ref{sec:precision-derivation});
+the block-tridiagonal sparsity pattern that makes everything cheap
+(\S\ref{sec:tridiag}); the equivalent penalized-least-squares
+interpretation (\S\ref{sec:penalized}); the block-LDL$^\top$
+factorization, which is the Kalman filter in disguise
+(\S\ref{sec:ldl}); the Takahashi backward sweep for posterior
+covariances, which is the RTS smoother in disguise
+(\S\ref{sec:selinv}); the marginal log-likelihood
+(\S\ref{sec:marg-loglik}); and the two standard practical adaptations
+that come essentially for free in this representation, missing data
+(\S\ref{sec:missing}) and diffuse initialization
+(\S\ref{sec:diffuse}).
+
+Each of these is an immediate corollary of the conditional-Gaussian
+formula~\eqref{eq:smooth-mean}--\eqref{eq:smooth-cov}, recast in the
+representation that exposes the state-space sparsity.
+
+\subsection{Posterior precision and information vector}
+\label{sec:precision-derivation}
+
+The posterior kernel of $X\mid Y$ is
+\begin{equation}
+-\tfrac12(GX-c_W)'\Omega^{-1}(GX-c_W)-\tfrac12(Y-\mathcal HX-\mathcal D Z)'\Sigma^{-1}(Y-\mathcal HX-\mathcal D Z).
+\end{equation}
+Collecting terms in $X$ gives the posterior precision matrix
+\begin{equation}
+J=G'\Omega^{-1}G+\mathcal H'\Sigma^{-1}\mathcal H
+\label{eq:Jdef}
+\end{equation}
+and information vector
+\begin{equation}
+h=G'\Omega^{-1}c_W+\mathcal H'\Sigma^{-1}(Y-\mathcal D Z).
+\label{eq:hdef}
+\end{equation}
+Therefore the smoothed mean and posterior mode solve
+\begin{equation}
+J\widehat X=h.
+\label{eq:simks}
+\end{equation}
+This is the simultaneous Kalman smoother.
+
+Several features of this formula deserve emphasis.  The exogenous
+input $Z$ enters \emph{only} the information vector $h$ and never
+the precision matrix $J$.  Concretely, the dynamics contribution
+$G'\Omega^{-1}c_W$ adds the propagated terms $Q^{-1}Bz_t$ and
+$-F'Q^{-1}Bz_t$ to adjacent blocks of $h$, while the measurement
+contribution replaces $Y$ with the residual $Y-\mathcal DZ$ in the
+right-hand side.  The block-tridiagonal sparsity, the LDL$^\top$
+factorization cost, and the selected-inversion machinery are all
+identical to the no-exogenous case.  Switching exogenous inputs on
+and off changes only the right-hand side of one sparse linear solve.
+
+Equation~\eqref{eq:Jdef} is just the Woodbury rewriting of the dense
+formula~\eqref{eq:smooth-cov}.  To see this, recall that
+$\Sigma_X^{-1}=G^\top\Omega^{-1}G$ (since $\Sigma_X=G^{-1}\Omega G^{-\top}$),
+and apply the matrix inversion lemma to~\eqref{eq:smooth-cov}:
+\begin{equation}
+\Sigma_{X\mid Y}^{-1}=\Sigma_X^{-1}+\mathcal H^\top\Sigma^{-1}\mathcal H
+=G^\top\Omega^{-1}G+\mathcal H^\top\Sigma^{-1}\mathcal H=J.
+\end{equation}
+Similarly $\widehat X=\mu_{X\mid Y}=J^{-1}h$ reproduces
+\eqref{eq:smooth-mean}.  So $J\widehat X=h$ is not a separate derivation
+of the smoother; it is the same Gaussian conditioning written in a
+representation that exposes the sparsity.
+
+\subsection{The block-tridiagonal structure}
+\label{sec:tridiag}
+
+Since $G$ is block bidiagonal, $G'\Omega^{-1}G$ is block tridiagonal.
+Since measurements enter one period at a time, $\mathcal H'\Sigma^{-1}\mathcal H$
+is block diagonal.  Thus $J$ is block tridiagonal.
+
+For the time-invariant model,
+\begin{equation}
+\resizebox{\textwidth}{!}{$
+\renewcommand{\arraystretch}{1.25}
+\setlength{\arraycolsep}{3pt}
+J=\begin{pmatrix}
+P_0^{-1}+F'Q^{-1}F & -F'Q^{-1} & 0 & \cdots & 0\\
+-Q^{-1}F & Q^{-1}+F'Q^{-1}F+H'R^{-1}H & -F'Q^{-1} & \cdots & 0\\
+0 & -Q^{-1}F & Q^{-1}+F'Q^{-1}F+H'R^{-1}H & \ddots & \vdots\\
+\vdots & \vdots & \ddots & \ddots & -F'Q^{-1}\\
+0 & 0 & \cdots & -Q^{-1}F & Q^{-1}+H'R^{-1}H
+\end{pmatrix}.
+$}
+\end{equation}
+The corresponding right-hand side is, in the no-exogenous case,
+\begin{equation}
+h=\begin{pmatrix}P_0^{-1}a_0\\ H'R^{-1}y_1\\ H'R^{-1}y_2\\ \vdots\\ H'R^{-1}y_T\end{pmatrix}.
+\end{equation}
+With exogenous inputs, the right-hand side becomes
+\begin{equation}
+h=\begin{pmatrix}P_0^{-1}a_0-F'Q^{-1}Bz_1\\[2pt]
+H'R^{-1}(y_1-Dz_1)+Q^{-1}Bz_1-F'Q^{-1}Bz_2\\[2pt]
+H'R^{-1}(y_2-Dz_2)+Q^{-1}Bz_2-F'Q^{-1}Bz_3\\[2pt]
+\vdots\\[2pt]
+H'R^{-1}(y_T-Dz_T)+Q^{-1}Bz_T\end{pmatrix},
+\end{equation}
+where the $Bz_t$ contributions enter from both the predicting and the
+predicted side of each transition.  The block-tridiagonal structure of
+$J$ is unaffected.
+
+\subsection{Equivalent penalized least-squares problem}
+\label{sec:penalized}
+
+The same object is obtained as the minimizer of
+\begin{align}
+L(X)
+&=(x_0-a_0)'P_0^{-1}(x_0-a_0)\\
+&\quad+\sum_{t=1}^T (x_t-Fx_{t-1}-Bz_t)'Q^{-1}(x_t-Fx_{t-1}-Bz_t)\\
+&\quad+\sum_{t=1}^T (y_t-Hx_t-Dz_t)'R^{-1}(y_t-Hx_t-Dz_t).
+\end{align}
+The first-order conditions are exactly $J\widehat X=h$.  This view is
+usually the most transparent one: smoothing is a structured penalized
+least-squares problem.  The exogenous terms $Bz_t$ and $Dz_t$ enter the
+objective as deterministic shifts of the residuals, so they fall out
+when the gradient is taken; they appear only on the right-hand side
+of the resulting linear system.
+
+\subsection{The recursive filter as a block-LDL$^{\top}$ forward sweep}
+\label{sec:ldl}
+\label{sec:LDL}
+
+The recursive Kalman filter and the simultaneous smoother are the same
+object.  This section makes that statement precise.
+
+Because $J$ is symmetric positive definite and block tridiagonal, it
+admits a unique block-LDL$^\top$ factorization
+\begin{equation}
+J=LDL^\top,
+\end{equation}
+where $L$ is block lower-bidiagonal with identity diagonal blocks, and
+$D=\diag(D_0,D_1,\ldots,D_T)$.  Write the off-diagonal blocks of $L$ as
+$L_{t,t-1}=M_t$; this is the convention used by the package code
+(\texttt{simks\_selected\_inv}).\footnote{Some references instead set
+$L_{t,t-1}=-M_t$, which flips the sign of every $M_t$ below and of the
+off-diagonal line in the Takahashi recursion of
+Section~\ref{sec:selinv}.  Either convention is fine; mixing them is
+not.}
+
+Matching blocks of $LDL^\top$ to blocks of $J$ determines the factors.
+The $(t,t-1)$ block of $LDL^\top$ is $L_{t,t-1}D_{t-1}=M_tD_{t-1}$, and
+the $(t,t)$ block is $D_t+M_tD_{t-1}M_t^\top$.  Because the blocks do
+not commute, the order of multiplication matters: $M_t$ must be
+recovered by a \emph{right} solve against $D_{t-1}$,
+\begin{align}
+D_0 &= J_{00}=P_0^{-1}+F'Q^{-1}F,\\
+M_t &= J_{t,t-1}\,D_{t-1}^{-1}=-\,Q^{-1}F\,D_{t-1}^{-1},
+\qquad t\ge 1,\\
+D_t &= J_{tt}-M_t\,D_{t-1}\,M_t^\top.
+\label{eq:LDLstep}
+\end{align}
+
+This recursion is the Kalman filter, written in precision form --- but
+the identification of the pivots requires one step of care.  The
+diagonal pivots $D_t$ are \emph{not} the filtered precisions for
+interior periods, because the block $J_{tt}=Q^{-1}+F'Q^{-1}F+H'R^{-1}H$
+natively carries the prior-precision contribution $F'Q^{-1}F$ of the
+\emph{outgoing} transition to $x_{t+1}$.  Define instead
+\begin{equation}
+C_t \;=\; D_t-F'Q^{-1}F \quad (t<T),
+\qquad
+C_T \;=\; D_T,
+\label{eq:Ct-def}
+\end{equation}
+stripping the outgoing term (the terminal block has no outgoing
+transition, which is why $D_T$ needs no correction).  Substituting
+\eqref{eq:LDLstep} and $J_{tt}$ into \eqref{eq:Ct-def},
+\begin{equation}
+C_t
+= Q^{-1}-Q^{-1}F\,\bigl(C_{t-1}+F'Q^{-1}F\bigr)^{-1}F'Q^{-1}
+  + H'R^{-1}H,
+\end{equation}
+and the Woodbury identity collapses the first two terms:
+\begin{equation}
+C_t=\bigl(Q+F\,C_{t-1}^{-1}F'\bigr)^{-1}+H'R^{-1}H .
+\end{equation}
+Setting $P_{t\mid t}=C_t^{-1}$, this is exactly
+\begin{equation}
+P_{t\mid t}^{-1}=P_{t\mid t-1}^{-1}+H'R^{-1}H,
+\qquad
+P_{t\mid t-1}=FP_{t-1\mid t-1}F'+Q,
+\end{equation}
+the filtered/predicted covariance updates of the textbook Kalman
+recursion, in their precision-form equivalents, with the anchor
+$C_0=D_0-F'Q^{-1}F=P_0^{-1}=P_{0\mid 0}^{-1}$.  The forward solve
+$Lu=h$ likewise produces the filtered \emph{means} in information
+form: $u_t=C_t\,\widehat x_{t\mid t}=P_{t\mid t}^{-1}\widehat x_{t\mid t}$,
+the information state of the information-filter literature.
+
+The backward solve $L^\top \widehat X=D^{-1}u$ then propagates information
+backward.  Identifying the smoothing gain
+\begin{equation}
+A_t=P_{t\mid t}F' P_{t+1\mid t}^{-1}
+\end{equation}
+in the back-substitution yields
+\begin{equation}
+\widehat x_{t\mid T}=\widehat x_{t\mid t}+A_t\bigl(\widehat x_{t+1\mid T}-F\widehat x_{t\mid t}\bigr),
+\end{equation}
+which is the Rauch--Tung--Striebel smoother.
+
+The message is not that ``$J\widehat X=h$ is faster than the recursive
+filter''.  Both cost $O(Tn^3)$, because they are the same operation
+written two ways.  The message is that the Kalman filter is the
+block-LDL$^\top$ factorization of $J$ done by hand, and that this
+factorization is what makes the operation $O(Tn^3)$ rather than
+$O(T^3n^3)$.  Modern sparse direct solvers (CHOLMOD, etc.) discover
+this factorization automatically.  See \citet{Davis2006}.
+
+\subsection{Posterior covariances via selected inversion}
+\label{sec:selinv}
+
+The posterior covariance of the smoothed path is $J^{-1}$.  Forming
+$J^{-1}$ densely costs $O(T^3n^3)$ and is wasteful: we usually want only
+the diagonal and first sub-diagonal blocks
+\begin{equation}
+\Sigma_{tt}=\Cov(x_t\mid Y),
+\qquad
+\Sigma_{t+1,t}=\Cov(x_{t+1},x_t\mid Y),
+\end{equation}
+for EM updates and for posterior bands.
+
+These blocks can be computed by Takahashi's recursion, due to
+\citet{TakahashiFaganChen1973} and \citet{ErismanTinney1975}.  Starting from $LDL^\top$
+of the previous section, $J^{-1}=L^{-\top}D^{-1}L^{-1}$.  With
+$M_t=L_{t,t-1}=J_{t,t-1}D_{t-1}^{-1}$ exactly as defined in
+Section~\ref{sec:LDL}, the recursion is, for $t=T,T-1,\ldots,0$,
+\begin{align}
+\Sigma_{TT}&=D_T^{-1},\\
+\Sigma_{t+1,t}&=-\Sigma_{t+1,t+1}M_{t+1},\\
+\Sigma_{tt}&=D_t^{-1}+M_{t+1}^\top\,\Sigma_{t+1,t+1}\,M_{t+1}.
+\end{align}
+(These three lines are derived by equating the strict upper triangle
+of $L^\top\Sigma=D^{-1}L^{-1}$ to its right-hand side and reading off
+blocks; the sign on the middle line is tied to the convention
+$L_{t,t-1}=+M_t$ --- under the alternative convention
+$L_{t,t-1}=-M_t$ it flips, a classic source of transcription errors.
+Note that for the state-space blocks $M_{t+1}=-Q^{-1}FD_t^{-1}$, so
+$\Sigma_{t+1,t}=\Sigma_{t+1,t+1}Q^{-1}FD_t^{-1}$ is positive in the
+scalar AR(1) case with $\phi>0$, as it must be: adjacent smoothed
+states are positively correlated under persistent dynamics.)
+That is: at each step backward, we need the diagonal block just above
+and only the LDL factors of $J$.  Total cost $O(Tn^3)$.
+
+The familiar RTS smoother covariance update
+\begin{equation}
+P_{t\mid T}=P_{t\mid t}+A_t(P_{t+1\mid T}-P_{t+1\mid t})A_t'
+\end{equation}
+is exactly this Takahashi backward recursion in the precision-form
+coordinates of Section~\ref{sec:LDL}.
+
+\subsection{Marginal log-likelihood}
+\label{sec:marg-loglik}
+\label{sec:loglik}
+
+For maximum likelihood, model comparison, or any kind of likelihood-based
+inference, we need $\log p(Y;\theta)$, not the joint $\log p(X,Y;\theta)$
+at a particular $X$.  The simultaneous formulation gives it cleanly.
+
+From~\eqref{eq:dyn} and~\eqref{eq:meas}, $(X,Y)$ is jointly Gaussian.
+Standard manipulations give
+\begin{equation}
+\log p(Y;\theta) = -\tfrac12(Y-\mathcal H a-\mathcal D Z)'\Omega_Y^{-1}(Y-\mathcal H a-\mathcal D Z)
+                   -\tfrac12 \log\det \Omega_Y
+                   -\tfrac{mT}{2}\log(2\pi),
+\end{equation}
+where $a=G^{-1}c_W$ (which now incorporates the propagated $Bz_t$) and
+$\Omega_Y=\mathcal H G^{-1}\Omega G^{-\top}\mathcal H'+\Sigma$.  Working
+directly with $\Omega_Y$ is what the recursive Kalman filter does
+implicitly via the innovations representation, at $O(Tn^3)$ cost.
+
+The simultaneous form is more direct.  Complete the square in $X$:
+\begin{equation}
+\log p(X,Y;\theta)
+=-\tfrac12 X'JX+h'X+\text{const}(\theta,Y).
+\end{equation}
+Integrating $X$ out using
+$\int\exp(-\tfrac12X'JX+h'X)\,dX
+=(2\pi)^{(T+1)n/2}(\det J)^{-1/2}\exp(\tfrac12h'J^{-1}h)$ gives
+\begin{equation}
+\log p(Y;\theta)
+=+\tfrac12 h'J^{-1}h-\tfrac12 \log\det J + \text{const}'(\theta,Y),
+\label{eq:marg-ll-integrated}
+\end{equation}
+where the remaining constant collects the prior and measurement
+normalizing terms.  The signs deserve a second look, because both are
+easy to get backwards: the completed-square quadratic enters with a
+\emph{plus} ($+\tfrac12h'J^{-1}h$), and the log-determinant enters with
+a \emph{minus} ($-\tfrac12\log\det J$).  The sanity check on the
+latter: a more concentrated posterior on the latent path means a larger
+$\det J$, and concentrating the latent states strictly \emph{reduces}
+the integrated mass, so $\log\det J$ must lower the marginal
+likelihood.  Writing out the constant, and using
+$\widehat X=J^{-1}h$ so that $h'J^{-1}h=\widehat X'h$,
+\begin{align}
+\log p(Y;\theta)
+&=\tfrac12 \widehat X'h
+ -\tfrac12 c_W'\Omega^{-1}c_W
+ -\tfrac12 (Y-\mathcal DZ)'\Sigma^{-1}(Y-\mathcal DZ) \nonumber\\
+&\quad -\tfrac12 \log\det J
+ -\tfrac12 \log\det\Omega
+ -\tfrac12 \log\det\Sigma
+ -\tfrac{mT}{2}\log(2\pi).
+\label{eq:marg-ll}
+\end{align}
+Two exogenous-input details matter here and are easy to drop.  First,
+the measurement quadratic uses the exogenous-adjusted residual
+$Y-\mathcal DZ$, not $Y$ itself.  Second, the dynamics quadratic uses
+the full stacked offset $c_W=(a_0',\,(Bz_1)',\ldots,(Bz_T)')'$, so
+\begin{equation}
+c_W'\Omega^{-1}c_W
+=a_0'P_0^{-1}a_0+\sum_{t=1}^T (Bz_t)'Q^{-1}(Bz_t),
+\end{equation}
+and $h$ in the $\widehat X'h$ term is the full information vector of
+\eqref{eq:hdef}, which already carries the propagated $Bz_t$
+contributions.  (With $B=D=0$ both reduce to the familiar
+no-exogenous expressions $a_0'P_0^{-1}a_0$ and $Y'\Sigma^{-1}Y$.)
+Every term in~\eqref{eq:marg-ll} is cheap.  The log-determinant
+$\log\det J$ is read off from the diagonal of $D$ in $J=LDL^\top$,
+or equivalently from twice the sum of $\log$ of the diagonal of the
+Cholesky factor.  Sparse Cholesky on $J$ delivers both $\widehat X$ and
+$\log\det J$ in a single call.
+
+\subsection{Missing data}
+\label{sec:missing}
+
+Suppose at time $t$ only a subset $S_t\subseteq\{1,\ldots,m\}$ of the
+observation channels is available, and $y_{t}^{S_t}$ denotes the
+observed sub-vector.  In the simultaneous formulation, the only thing
+that changes is the measurement contribution at $t$:
+\begin{equation}
+H'R^{-1}H \;\longrightarrow\; H_{S_t}'R_{S_t}^{-1}H_{S_t},
+\qquad
+H'R^{-1}y_t \;\longrightarrow\; H_{S_t}'R_{S_t}^{-1}y_t^{S_t}.
+\end{equation}
+A fully missing observation contributes nothing; the corresponding
+diagonal block of $J$ is just $Q^{-1}+F'Q^{-1}F$ (or its endpoint
+analogue), with no measurement term.
+
+There is no special ``missing-data Kalman filter''.  There is just $J$
+and $h$, assembled from whatever measurements exist.
+
+\subsection{Diffuse initialization}
+\label{sec:diffuse}
+
+If we do not want to commit to a prior on $x_0$, take the limit
+$P_0^{-1}\to 0$.  In~\eqref{eq:simks}, this simply drops the prior block
+from the top-left of $J$ and the term $P_0^{-1}a_0$ from $h$.  Provided
+the dynamics and measurements together identify $x_0$ (essentially: $x_0$
+appears in some path that has observations downstream), $J$ remains
+positive definite and the solve is well-posed.  This is the
+``proper'' diffuse limit; the recursive analogue requires the careful
+exact-initial-Kalman-filter treatment of \citet{deJong1989} and
+\citet{KoopmanDurbin2003}.
+
+\section{Time-varying systems}
+\label{sec:tv}
+
+A third small edit, also forecast in Section~\ref{sec:mvn}.  Replacing
+the constant matrices $F,H,Q,R$ with sequences $F_t,H_t,Q_t,R_t$ leaves
+the conditional Gaussian~\eqref{eq:smooth-mean}--\eqref{eq:smooth-cov}
+formally unchanged; only the entries of $G$, $\Omega$, $\mathcal H$,
+and $\Sigma$ change.  For
+\begin{align}
+x_t&=F_tx_{t-1}+w_t,\quad w_t\sim N(0,Q_t),\\
+y_t&=H_tx_t+v_t,\quad v_t\sim N(0,R_t),
+\end{align}
+the dynamics matrix becomes
+\begin{equation}
+G=\begin{pmatrix}
+I & 0 & 0 & \cdots & 0\\
+-F_1 & I & 0 & \cdots & 0\\
+0 & -F_2 & I & \ddots & \vdots\\
+\vdots & \ddots & \ddots & \ddots & 0\\
+0 & 0 & \cdots & -F_T & I
+\end{pmatrix}
+\end{equation}
+and $\Omega=\diag(P_0,Q_1,\ldots,Q_T)$.  The precision matrix remains
+block tridiagonal, with blocks
+\begin{align}
+J_{00} &= P_0^{-1}+F_1'Q_1^{-1}F_1,\\
+J_{tt} &= Q_t^{-1}+F_{t+1}'Q_{t+1}^{-1}F_{t+1}+H_t'R_t^{-1}H_t,\quad 1\le t\le T-1,\\
+J_{TT} &= Q_T^{-1}+H_T'R_T^{-1}H_T,\\
+J_{t,t-1}&=-Q_t^{-1}F_t,\qquad J_{t-1,t}=-F_t'Q_t^{-1}.
+\end{align}
+Everything downstream --- LDL$^\top$ factorization, selected inversion,
+marginal log-likelihood, EM --- carries over unchanged.  This is
+the modularity claim in concrete form.
+
+\section{Estimating Model Parameters}
+\label{sec:em}
+
+Suppose $F$ and $H$ are unknown but constant over time.  The natural
+objective is
+\begin{align}
+\min_{X,F,H,Q,R} \quad
+&(x_0-a_0)'P_0^{-1}(x_0-a_0)\\
+&+\sum_{t=1}^T (x_t-Fx_{t-1})'Q^{-1}(x_t-Fx_{t-1})\\
+&+\sum_{t=1}^T (y_t-Hx_t)'R^{-1}(y_t-Hx_t),
+\end{align}
+together with the implicit $-T\log\det Q-T\log\det R$ from the Gaussian
+normalizing constants if $Q,R$ are also to be estimated.
+
+\subsection{Quick-and-dirty: alternating regressions}
+
+The simplest scheme is: given $(F,H,Q,R)$, solve for $X$ with the
+simultaneous smoother; given $X$, update $F$ and $H$ by ordinary least
+squares,
+\begin{equation}
+\widehat F=\bigl(\textstyle\sum_t x_tx_{t-1}'\bigr)\bigl(\textstyle\sum_t x_{t-1}x_{t-1}'\bigr)^{-1},
+\quad
+\widehat H=\bigl(\textstyle\sum_t y_tx_t'\bigr)\bigl(\textstyle\sum_t x_tx_t'\bigr)^{-1},
+\end{equation}
+and then update $Q,R$ by residual covariances.  This is conceptually
+clean but the $Q$ and $R$ estimates are biased: they ignore the fact
+that the smoothed $x_t$ is a posterior mean, not a sample from the
+posterior.
+
+\subsection{Proper Gaussian EM}
+
+The unbiased fix is the standard EM algorithm of \citet{ShumwayStoffer1982}
+and \citet{Watson1983}.  The E-step computes the smoothed sufficient
+statistics
+\begin{align}
+S_{00} &= \sum_{t=1}^T \E[x_{t-1}x_{t-1}'\mid Y] = \sum_{t=1}^T \bigl(\widehat x_{t-1\mid T}\widehat x_{t-1\mid T}'+\Sigma_{t-1,t-1}\bigr),\\
+S_{11} &= \sum_{t=1}^T \E[x_tx_t'\mid Y] = \sum_{t=1}^T \bigl(\widehat x_{t\mid T}\widehat x_{t\mid T}'+\Sigma_{tt}\bigr),\\
+S_{10} &= \sum_{t=1}^T \E[x_tx_{t-1}'\mid Y] = \sum_{t=1}^T \bigl(\widehat x_{t\mid T}\widehat x_{t-1\mid T}'+\Sigma_{t,t-1}\bigr).
+\end{align}
+The posterior covariance terms $\Sigma_{tt}$ and $\Sigma_{t,t-1}$ are
+delivered by the selected-inversion recursion of Section~\ref{sec:selinv}.
+The M-step then solves
+\begin{align}
+\widehat F &= S_{10}S_{00}^{-1},\\
+\widehat Q &= \tfrac1T\bigl(S_{11}-S_{10}S_{00}^{-1}S_{10}'\bigr),\\
+\widehat H &= \bigl(\textstyle\sum_t y_t\widehat x_{t\mid T}'\bigr)\bigl(\textstyle\sum_t (\widehat x_{t\mid T}\widehat x_{t\mid T}'+\Sigma_{tt})\bigr)^{-1},\\
+\widehat R &= \tfrac1T\textstyle\sum_t \bigl((y_t-\widehat H\widehat x_{t\mid T})(y_t-\widehat H\widehat x_{t\mid T})' + \widehat H\Sigma_{tt}\widehat H'\bigr).
+\end{align}
+The initial-state parameters are updated as well, by the standard
+\citet{ShumwayStoffer1982} single-observation M-step
+\begin{equation}
+\widehat a_0=\widehat x_{0\mid T},
+\qquad
+\widehat P_0=\Sigma_{00}
+\;\bigl(=\Sigma_{00}+(\widehat x_{0\mid T}-\widehat a_0)(\widehat x_{0\mid T}-\widehat a_0)'
+\text{ evaluated at the new } \widehat a_0\bigr),
+\end{equation}
+which is what \texttt{simks\_em\_const} and \texttt{em\_const}
+implement; the returned \texttt{a0} and \texttt{P0} are therefore
+genuinely estimated quantities, not pass-throughs of the
+initialization.  (Estimating $(a_0,P_0)$ from one effective
+observation is, of course, weakly informative; fixing them, or using
+the diffuse initialization of Section~\ref{sec:diffuse}, are the
+standard alternatives.)
+The marginal log-likelihood~\eqref{eq:marg-ll} is non-decreasing across
+iterations.  Monitoring it is a useful sanity check; the demo
+\texttt{demo\_const\_em.m} does exactly that.
+
+The cost per iteration is dominated by the smoother solve and the
+selected inversion, both $O(Tn^3)$.
+
+\subsection{Exogenous loadings as a regression augmentation}
+
+When the model includes exogenous inputs, the EM M-step generalizes
+in the most natural way possible.  The state-side update becomes a
+joint regression of $\widehat x_{t\mid T}$ on the augmented regressor
+$(\widehat x_{t-1\mid T},\,z_t)$:
+\begin{equation}
+\begin{pmatrix}\widehat F & \widehat B\end{pmatrix}
+=\begin{pmatrix}S_{10} & S_{1z}\end{pmatrix}
+\begin{pmatrix}S_{00} & S_{0z}\\ S_{0z}^\top & S_{zz}\end{pmatrix}^{-1},
+\label{eq:em-FB}
+\end{equation}
+where $S_{1z}=\sum_t \widehat x_{t\mid T}z_t^\top$,
+$S_{0z}=\sum_t \widehat x_{t-1\mid T}z_t^\top$, and
+$S_{zz}=\sum_t z_t z_t^\top$.  The same construction applies to the
+measurement side:
+\begin{equation}
+\begin{pmatrix}\widehat H & \widehat D\end{pmatrix}
+=\begin{pmatrix}S_{yx} & S_{yz}\end{pmatrix}
+\begin{pmatrix}S_{xx} & S_{xz}\\ S_{xz}^\top & S_{zz}^{\text{obs}}\end{pmatrix}^{-1},
+\end{equation}
+and the noise covariances $\widehat Q,\widehat R$ then follow by
+the standard residual-sum-of-squares formulas with cross-terms.
+
+The shape of these updates is the substantive payoff of including
+$z_t$ from the outset.  Estimating the loading of a credit gap on
+output trend is mechanically identical to estimating the autoregressive
+coefficient: both are coefficients on a regressor in
+$\widehat x_t = [\widehat F\,\widehat B](\widehat x_{t-1},\,z_t)^\top$.
+The simultaneous smoother delivers the smoothed sufficient statistics
+the regression needs.
+
+The demo \texttt{demo\_hp\_credit.m} runs this machinery on a
+simulated HP-plus-credit-cycle setup with structural breaks and
+outlier contamination.  To be precise about what is combined and how:
+the demo compares \emph{separate} estimators on the same data ---
+Gaussian smoothing without and with the true exogenous loadings,
+robust Student-$t$ smoothing (Section~\ref{sec:robust}) at the true
+parameters, and Gaussian EM that estimates $(F,H,Q,R,B,D)$ jointly.
+It does \emph{not} run an integrated robust-EM procedure (alternating
+IRLS weight updates with M-step parameter updates); such a generalized
+EM is a natural and straightforward extension of the two building
+blocks, but it is not implemented in the package, and we flag that
+explicitly rather than imply otherwise.  The realistic ingredients for
+applied macroeconomic work are nonetheless all present: parameters are
+unknown, the data are imperfect, and the underlying dynamics include
+observed drivers.
+
+\section{Beyond the Standard Model}
+\label{sec:beyond}
+
+So far the smoothing problem has been a textbook linear Gaussian
+state-space system with constant or time-varying matrices.  Most
+substantively interesting macroeconomic state-space problems
+violate at least one of these assumptions: data contain outliers
+or structural breaks (so the Gaussian assumption fails); regimes
+shift between expansions and recessions (so the linearity
+assumption fails); or known structural bounds rule out parts of
+the latent path (so the posterior is truncated).  The recursive
+Kalman filter loses its closed-form structure in each of these
+cases and is patched only by case-specific machinery.  The
+simultaneous form, by contrast, handles all three with the same
+sparse linear-algebra primitives: in every case the algorithm is
+either iteratively reweighted solves on the same $J$, or
+variational EM with $J$ assembled from responsibility-weighted
+expected quadratic forms, or a sparse QP whose Hessian is $J$ plus
+a low-rank update.  This section develops the three cases.
+
+\subsection{Non-Gaussian disturbances}
+\label{sec:robust}
+
+The stacked formulation extends naturally beyond Gaussian errors.
+Replace the quadratic penalties by general negative log densities:
+\begin{equation}
+\min_X \sum_{t=1}^T \rho_w(x_t-Fx_{t-1})+
+\sum_{t=1}^T \rho_v(y_t-Hx_t)+\rho_0(x_0-a_0).
+\end{equation}
+The exact closed-form solve is lost, but the sparsity is preserved:
+each $x_t$ still interacts only with $x_{t-1}$, $x_{t+1}$, and $y_t$.
+The same $J$ pattern, with weights updated each iteration, supports a
+broad family of robust state-space smoothers.  This section makes that
+concrete.
+
+\subsubsection{Heavy tails as Gaussian scale mixtures}
+
+The practically important case is heavy-tailed measurement noise (to
+robustify against outliers) and heavy-tailed state innovations (to
+permit structural breaks).  Both are handled cleanly by the
+\emph{Gaussian scale mixture} representation
+\citep{AndrewsMallows1974}:
+\begin{equation}
+v_t \mid \tau_t \sim N(0,\,R/\tau_t),
+\qquad \tau_t \sim p(\tau \mid \text{family}).
+\end{equation}
+Marginalizing $\tau_t$ out gives the desired heavy-tailed marginal:
+\begin{itemize}[leftmargin=2em]
+\item Student-$t$ with $\nu$ degrees of freedom: $\tau \sim
+  \text{Gamma}(\nu/2,\,\nu/2)$.
+\item Laplace (double exponential): $\tau$ has an inverse-exponential
+  distribution.
+\end{itemize}
+Throughout this section, $\delta_t=(r_t^\top R^{-1}r_t)^{1/2}$ denotes
+the \emph{Mahalanobis distance} of the period-$t$ residual, so
+$\delta_t^2$ is the squared distance (the quadratic form itself); the
+two are easy to confuse in implementation, and the update formulas
+below are stated in terms of $\delta_t^2$ where the quadratic form is
+meant.  The Huber loss is deliberately \emph{not} on the list above:
+its working weight $\min(1,\,c/\delta_t)$ depends on the realized
+residual, whereas a mixing distribution $p(\tau)$ in a proper Gaussian
+scale mixture cannot.  Huber smoothing is therefore best understood
+not as a latent-scale model but as classical IRLS on the Huber
+$\rho$-function \citep{HollandWelsch1977}: the weight
+$\psi(\delta)/\delta=\min(1,c/\delta)$ is the majorize--minimize
+multiplier that makes each reweighted Gaussian solve a tangent
+quadratic to the Huber objective.  It plugs into exactly the same
+sparse machinery, but its justification is the loss function, not a
+mixture representation.
+Conditional on the $\tau_t$, the model is Gaussian with time-varying
+covariance $R_t = R/\tau_t$, and the simultaneous smoother of
+Section~\ref{sec:tv} applies without modification.
+
+\subsubsection{EM and IRLS on the same sparse system}
+
+The natural inference algorithm alternates reweighted Gaussian solves
+with weight updates \citep{LangeLittleTaylor1989}.
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Reweighted solve.}  Given the current weights $\tau_t^{(k)}$,
+  solve the time-varying Gaussian smoother with $R_t = R/\tau_t^{(k)}$.
+  This is one sparse Cholesky on the same $J$ pattern.
+\item \textbf{Weight update.}  Given the smoothed $\widehat X^{(k+1)}$,
+  update each weight from the smoothed residual
+  \begin{equation}
+  r_t = y_t - H \widehat x_{t\mid T}^{(k+1)} - Dz_t,
+  \end{equation}
+  where the exogenous offset $Dz_t$ must be subtracted whenever the
+  model has measurement-side inputs.  For Student-$t$,
+  \begin{equation}
+  \tau_t^{(k+1)} = \frac{\nu + m_t}{\nu + r_t^\top R^{-1} r_t},
+  \end{equation}
+  where $m_t$ is the number of observed entries of $y_t$.  For Laplace,
+  $\tau_t = (r_t^\top R^{-1} r_t)^{-1/2}$.  For Huber,
+  $\tau_t = \min(1,\, c/\delta_t)$, with the canonical
+  $c=1.345$ \citep{HollandWelsch1977}.
+\end{enumerate}
+Each iteration costs one $O(Tn^3)$ sparse Cholesky.  The sparsity
+pattern of $J$ is identical to the Gaussian case; only the numerical
+values of the diagonal blocks change.
+
+It is worth being precise about what this iteration computes, because
+two related but distinct targets are in circulation.  As written ---
+with weights evaluated by \emph{plugging in} the residual at the
+current smoothed mean --- the fixed point is the posterior
+\emph{mode} of the heavy-tailed model: plug-in IRLS is exactly
+majorize--minimize on the non-Gaussian MAP objective.  This is a
+perfectly respectable estimand, and it is the package default.  It is
+\emph{not}, however, the E-step of an exact latent-scale EM algorithm,
+which requires the posterior \emph{expectation} of the residual
+quadratic form rather than its plug-in value.  Under the Gaussian
+approximation to the state posterior, that expectation is the plug-in
+value plus a covariance correction,
+\begin{equation}
+\E\bigl[\,r_t^\top R^{-1}r_t \,\big|\, Y\bigr]
+= \widehat r_t^{\,\top} R^{-1}\widehat r_t
+  + \tr\!\bigl(R^{-1}H\,\Sigma_{tt}\,H'\bigr),
+\label{eq:exact-estep-meas}
+\end{equation}
+with $\Sigma_{tt}$ delivered by the selected inversion of
+Section~\ref{sec:selinv}.  For Student-$t$ the package implements this
+covariance-corrected E-step as an option
+(\texttt{opts.exact\_estep} in Octave, \texttt{exact\_estep=True} in
+Python), at the cost of one selected inversion per iteration; the
+corrected weights are smaller in periods of high state uncertainty,
+which is the honest behaviour --- an apparently clean residual at an
+imprecisely estimated state is weaker evidence against an outlier than
+the plug-in update assumes.
+
+\subsubsection{State-side robustness}
+
+The same construction applies to the state innovations $w_t$.  Heavy
+tails on $w_t$ accommodate occasional large jumps in the latent path
+while still smoothing tightly through quiet periods.  The IRLS weights
+$\xi_t$ on $w_t$ are updated by exactly the same formulas as $\tau_t$,
+using the squared Mahalanobis distance (the quadratic form
+$\widehat w_t^\top Q^{-1}\widehat w_t$, not its square root) of the
+smoothed innovation
+\begin{equation}
+\widehat w_t = \widehat x_{t\mid T} - F \widehat x_{t-1\mid T} - Bz_t,
+\end{equation}
+and the time-varying state covariance becomes $Q_t = Q/\xi_t$.  The
+exogenous forcing $Bz_t$ must be subtracted here for the same reason
+as on the measurement side: otherwise known exogenous movements in the
+state would be misread as structural breaks.  The covariance-corrected
+E-step analogue of \eqref{eq:exact-estep-meas} uses
+\begin{equation}
+\E\bigl[\,w_t^\top Q^{-1}w_t \,\big|\, Y\bigr]
+= \widehat w_t^{\,\top} Q^{-1}\widehat w_t
+ + \tr\!\Bigl(Q^{-1}\bigl[\Sigma_{tt}-F\Sigma_{t,t-1}'-\Sigma_{t,t-1}F'
+ +F\Sigma_{t-1,t-1}F'\bigr]\Bigr),
+\end{equation}
+which requires the lag-one block $\Sigma_{t,t-1}$ in addition to the
+diagonal blocks --- both already produced by the same Takahashi sweep.
+
+This is the practical machinery for structural-break detection.  Set
+the state-innovation prior to Student-$t$ with $\nu = 4$, run the
+smoother, and read off the periods at which $\xi_t \ll 1$:  those are
+the breaks.  The demo \texttt{demo\_robust\_breaks.m} does this on a
+near-random-walk series with three injected level shifts; the
+algorithm identifies all three at $\xi_t < 0.02$ while
+$\xi_t \approx 1$ elsewhere, and the smoothed path achieves under a
+third of the RMSE of the Gaussian smoother.
+
+\subsubsection{Implementation}
+
+The package implements all of the above in
+\texttt{simks\_smooth\_robust.m}.  The interface is
+\begin{lstlisting}[language=Octave]
+[Xhat, info] = simks_smooth_robust(Y, F, H, Q, R, a0, P0, family, opts);
+\end{lstlisting}
+with \texttt{family} one of \texttt{'gaussian'}, \texttt{'student-t'},
+\texttt{'laplace'}, \texttt{'huber'}, and \texttt{opts.robust\_state}
+optionally activating the state-side variant.  The returned
+\texttt{info.tau\_v} (and \texttt{info.tau\_w}) is the per-period
+weight vector at convergence; values much smaller than $1$ are
+diagnostic flags for outlier observations or structural breaks.
+
+The demo \texttt{demo\_robust.m} contaminates 10\% of observations
+with extra noise and compares the Gaussian, Student-$t$, Huber, and
+Laplace smoothers.  Student-$t$ and Huber cut RMSE by roughly
+40~percent versus Gaussian and correctly downweight most outlier
+observations.
+
+\subsubsection{Beyond scale mixtures}
+
+The IRLS-on-the-same-$J$ scheme covers more than Gaussian scale
+mixtures.  Asymmetric Laplace gives quantile-style smoothing; smooth
+approximations of the $\ell_1$ penalty give pseudo-Huber; generalized
+linear measurement models (Poisson, binomial, multinomial) give
+non-Gaussian observation links, with the IRLS weights determined by
+the local curvature of the link function.  All of these inherit the
+sparsity structure of $J$ automatically.
+
+Thus the simultaneous view is not merely an alternative derivation of
+the Kalman smoother.  It is the right abstraction for a broader class
+of sparse latent-path estimation problems; see \citet{RueHeld2005} for
+the spatial-statistics counterpart.
+
+\subsection{Regime-switching dynamics}
+\label{sec:slds}
+
+Macroeconomic models often need state-space dynamics that depend on a
+discrete unobserved regime --- expansion versus recession, dovish
+versus hawkish monetary policy, high versus low financial-stress
+periods.  The natural model is a switching linear dynamical system
+(SLDS):
+\begin{align}
+x_t &= F_{s_t}\,x_{t-1}+B_{s_t}\,z_t+w_t,
+        \quad w_t\sim N(0,Q_{s_t}),\\
+y_t &= H x_t+D z_t+v_t,\quad v_t\sim N(0,R),
+\end{align}
+with $s_t\in\{1,\ldots,K\}$ a Markov chain on $K$ regimes with
+transition matrix $A$.
+
+The exact posterior $p(X,S\mid Y)$ is a Gaussian mixture with $K^T$
+components and intractable for any non-trivial $T$.  The standard
+scalable approach, due to \citet{GhahramaniHinton2000}, is variational
+EM with a single-Gaussian-times-Markov-chain factorization:
+\begin{equation}
+q(X,S)=q(X)\prod_{t=1}^T q(s_t).
+\end{equation}
+This decouples the two latent variables and turns inference into
+alternating updates of two tractable problems.
+
+\subsubsection{Variational EM iteration}
+
+Let $\pi_{t,k}=q(s_t=k)$ be the regime responsibilities.  Coordinate
+ascent on the evidence lower bound alternates two exact updates, and
+it is worth being careful about what ``exact'' means here, because a
+tempting shortcut --- smoothing under the responsibility-\emph{averaged}
+matrices $\widetilde F_t=\sum_k\pi_{t,k}F_k$,
+$\widetilde Q_t=\sum_k\pi_{t,k}Q_k$ --- is a moment-matching
+approximation, \emph{not} the variational update, and the two differ
+whenever the regimes are uncertain (note in particular that
+$\sum_k\pi_{t,k}Q_k^{-1}\neq(\sum_k\pi_{t,k}Q_k)^{-1}$).  The package
+implements the exact updates.
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{$q(X)$-step (smooth under expected quadratic forms).}
+  The optimal coordinate update sets
+  $\log q(X)=\E_{q(S)}\log p(X,S,Y)+\text{const}$, which is Gaussian,
+  with the expected transition term at $t$ averaging the per-regime
+  quadratic forms.  Collecting terms in $X$, the period-$t$
+  contributions to the precision matrix are
+  \begin{equation}
+  \overline{Q^{-1}}_t=\sum_{k=1}^K \pi_{t,k}Q_k^{-1},
+  \quad
+  \overline{Q^{-1}F}_t=\sum_{k=1}^K \pi_{t,k}Q_k^{-1}F_k,
+  \quad
+  \overline{F'Q^{-1}F}_t=\sum_{k=1}^K \pi_{t,k}F_k'Q_k^{-1}F_k,
+  \end{equation}
+  assembled as
+  $J_{tt}=\overline{Q^{-1}}_t+\overline{F'Q^{-1}F}_{t+1}+H'R^{-1}H$
+  and $J_{t,t-1}=-\overline{Q^{-1}F}_t$ (with the obvious endpoint
+  modifications), and with the information vector carrying the
+  matching mixed exogenous terms
+  $\overline{Q^{-1}B}_t\,z_t$ and $-\overline{F'Q^{-1}B}_{t+1}\,z_{t+1}$.
+  Crucially, this precision matrix is \emph{still block tridiagonal at
+  every iteration} --- the expected quadratic forms couple only
+  adjacent periods, exactly as in the fixed-regime model --- so each
+  $q(X)$-step is one sparse Cholesky of the usual structure; only the
+  block values change.
+\item \textbf{$q(S)$-step (regime update under expected
+  log-likelihoods).}  The optimal $q(s_t)$ update requires the
+  \emph{expected} Gaussian transition log-likelihood under $q(X)$,
+  not the density evaluated at the smoothed point path.  Writing
+  $\widehat d_{t,k}=\widehat x_t-F_k\widehat x_{t-1}-B_kz_t$,
+  \begin{equation}
+  \begin{split}
+  \ell_{t,k}
+  &=\E_{q(X)}\log N\bigl(x_t;F_kx_{t-1}+B_kz_t,Q_k\bigr)\\
+  &=-\tfrac12\Bigl[\widehat d_{t,k}^{\,\top}Q_k^{-1}\widehat d_{t,k}
+   +\tr\bigl(Q_k^{-1}\mathcal C_{t,k}\bigr)\Bigr]
+   -\tfrac12\log\det Q_k-\tfrac n2\log 2\pi,
+  \end{split}
+  \end{equation}
+  with the covariance correction
+  \begin{equation}
+  \mathcal C_{t,k}
+  =\Sigma_{tt}-F_k\Sigma_{t,t-1}'-\Sigma_{t,t-1}F_k'
+   +F_k\Sigma_{t-1,t-1}F_k'
+  \end{equation}
+  built from the diagonal and lag-one blocks that the selected
+  inversion of Section~\ref{sec:selinv} already produces.  The
+  standard discrete forward--backward HMM smoother is then run on the
+  pair $(A,\,e^{\ell})$, at $O(TK^2)$ cost, dominated by the state
+  smoothing.
+\end{enumerate}
+The two steps are iterated to convergence in $\pi$.  Typically 10--40
+iterations suffice for moderate-$T$ macroeconomic data.  The
+covariance corrections matter in both directions: omitting the trace
+terms (i.e.\ scoring regimes at the point path) systematically
+overstates regime-classification confidence, because a residual that
+looks small at an imprecisely estimated state is weaker evidence than
+the same residual at a well-pinned-down state.  A corollary worth
+knowing when designing a regime-switching exercise: regimes that
+differ mainly in innovation \emph{variance} are sharply classifiable
+only when the posterior state uncertainty is small relative to the
+quiet regime's innovation variance --- otherwise even an oracle
+observing the true states classifies imperfectly.
+
+The substantive payoff is that the precision-form formulation extends
+to regime-switching dynamics without any new mathematical machinery:
+every $q(X)$-step is one sparse Cholesky on a block-tridiagonal $J$ of
+the same pattern the no-switching smoother uses, and the covariance
+blocks the $q(S)$-step needs come from the same Takahashi sweep that
+EM already requires.  The recursive form, by contrast, loses its
+closed-form structure once regimes are introduced ---
+exact filtering would require maintaining $K^t$ Gaussians at time $t$,
+with the Kim and Hamilton filters performing per-step collapses to a
+single Gaussian per regime.  The simultaneous form makes a
+single-Gaussian approximation too, but as the optimal $q(X)$ within
+the variational family, with a monotone evidence-lower-bound
+interpretation rather than an ad hoc collapse.
+
+The demo \texttt{demo\_slds.m} implements a two-regime AR(1) with
+expansion/recession dynamics (persistence $\phi_1=0.85$,
+$\phi_2=0.50$; volatility $\sigma^2_1=0.02$, $\sigma^2_2=0.20$;
+measurement noise $R=0.01$, small relative to $\sigma_1^2$ per the
+corollary above).  The demo generates its data with a small portable
+random-number generator (a Park--Miller linear congruential generator
+plus Box--Muller, implemented identically in the Octave/MATLAB and
+Python versions), so all three environments simulate the same data
+and print the same numbers: regime classification accuracy
+$\approx 0.90$, mean $\pi_{t,\text{rec}}\approx 0.80$ during true
+recessions and $\approx 0.06$ during true expansions, and SLDS state
+RMSE of $0.095$ against $0.099$ for the single-regime Gaussian
+smoother run at averaged dynamics.
+
+\subsection{Constrained smoothing}
+\label{sec:constrained}
+
+Many macroeconomic state-space objects have known structural bounds
+that the textbook Gaussian smoother ignores.  A NAIRU estimate that
+goes negative is meaningless; a debt-to-GDP latent component that
+exceeds historical maxima is implausible; an equilibrium real interest
+rate is sometimes assumed monotone over a regime.  These are
+inequality constraints on the smoothed path,
+\begin{equation}
+A_{\text{ineq}}\,X\le b_{\text{ineq}}.
+\label{eq:ineq}
+\end{equation}
+Such constraints have no clean recursive-filter counterpart; the
+Kalman recursion produces a Gaussian conditional, which is in general
+not respected by any non-trivial inequality.
+
+\subsubsection{Constrained smoothing as a sparse QP}
+
+In the simultaneous formulation, constrained smoothing is the
+quadratic program
+\begin{equation}
+\min_X\ \tfrac12 X'JX-h'X
+\quad\text{s.t.}\quad A_{\text{ineq}}X\le b_{\text{ineq}},
+\label{eq:qp}
+\end{equation}
+with $J$ and $h$ exactly as before.  When the constraints are
+inactive at the unconstrained optimum, $\widehat X=J^{-1}h$ already
+solves~\eqref{eq:qp}; when some constraints bind, the solution is
+the constrained posterior mode.
+
+\subsubsection{Interior-point algorithm on the same sparse $J$}
+
+The standard primal-dual interior-point method uses a log-barrier:
+\begin{equation}
+X(\mu)=\argmin_X\ \tfrac12 X'JX-h'X-\mu\sum_{i=1}^{c}\log(b_i-a_i'X).
+\end{equation}
+The Newton step at $X$ requires solving
+\begin{equation}
+\Bigl(J+\mu\,A_{\text{ineq}}^\top\diag\bigl(1/(b-A_{\text{ineq}}X)^2\bigr)A_{\text{ineq}}\Bigr)\,\Delta X
+=-\nabla,
+\label{eq:newton}
+\end{equation}
+where the gradient is
+$\nabla=JX-h+\mu A_{\text{ineq}}^\top(1/(b-A_{\text{ineq}}X))$.
+The sign of the barrier term is worth a sanity check, since the
+displayed Hessian only pins it down implicitly: differentiating
+$-\mu\log(b_i-a_i'X)$ gives $+\mu\,a_i/(b_i-a_i'X)$, a force that
+blows up as the iterate approaches the boundary and pushes the
+minimizer back into the interior, exactly as a barrier should; with
+the opposite sign the ``barrier'' would attract iterates to the
+boundary and the method would degenerate into clipping.
+
+The structural point is that the Hessian is $J$ plus a low-rank
+positive-semidefinite update.  For typical macroeconomic
+constraints --- bounds on a single state coordinate at each $t$, or
+on adjacent differences --- $A_{\text{ineq}}$ is itself extremely
+sparse, often with only $O(n)$ nonzeros per row.  The augmented
+Hessian $J+\mu A_{\text{ineq}}^\top D\,A_{\text{ineq}}$ then remains
+block tridiagonal (component-wise bounds) or grows the bandwidth by
+one block (monotonicity constraints).  Either way, sparse Cholesky
+still applies, and the per-iteration cost stays $O(Tn^3)$.
+
+The barrier parameter $\mu$ is decreased geometrically until the
+duality gap is below tolerance.  Total cost is the number of Newton
+iterations times the sparse-Cholesky cost; typical convergence is
+20--60 inner iterations across 30--40 barrier reductions for a
+moderate-sized state-space problem with component-wise bounds.
+
+\subsubsection{Posterior interpretation}
+
+The QP solution is the constrained posterior \emph{mode}, not the
+posterior mean.  Under truncated Gaussian posteriors the mean differs
+from the mode in general; computing the mean requires sampling
+methods such as \citet{Botev2017}'s exact truncated-Gaussian
+algorithm.  For most applied macro uses --- displaying a smoothed
+trend that respects non-negativity, or a credible band whose
+endpoints respect a known structural bound --- the mode is the
+quantity of interest.
+
+The demo \texttt{demo\_constrained.m} imposes $x_t\ge 0$ on a noisy
+near-zero AR(1) smoother (a stand-in for a NAIRU-like object) and
+verifies that the constraint is exactly satisfied while the
+unconstrained smoother places $31/120$ periods below zero.  RMSE
+against the true non-negative trend improves by $\sim 4\%$, illustrating
+that imposing known structural information is information-efficient,
+not just cosmetic.
+
+\subsubsection{Inequality constraints beyond bounds}
+
+The same QP machinery handles a broad set of constraints:
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Box constraints.}  $\ell_t\le x_{t,j}\le u_t$ on
+  selected coordinates and periods: two rows per constraint.
+\item \textbf{Monotonicity.}  $x_{t+1,j}\ge x_{t,j}$ for a trend
+  component: rows that pick out $-x_{t+1,j}+x_{t,j}$.
+\item \textbf{Smoothness / curvature.}  Bounds on
+  $\Delta^2 x_t=x_t-2x_{t-1}+x_{t-2}$: three-period stencils.
+\item \textbf{Cone constraints.}  Bounds on $\|x_t\|_\infty$ etc.,
+  representable as collections of linear inequalities.
+\end{itemize}
+The simultaneous form turns each into a few extra sparse rows of
+$A_{\text{ineq}}$, with no impact on the underlying $J$.  This is
+the kind of extension that is essentially impossible to graft onto a
+recursive Kalman filter and easy to add here.
+
+\section{What you gain}
+
+Beyond working in the right idiom, the simultaneous formulation has
+four concrete advantages over the recursive form.
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Numerical robustness, properly scoped.}  Sparse Cholesky
+  on $J$ maintains symmetry and positive definiteness by construction:
+  $J$ is assembled, not propagated, so the failure mode of a hand-coded
+  recursive filter --- losing definiteness through subtractions of
+  large covariance matrices, the reason the square-root, UDU, and
+  Bierman--Thornton variants exist --- cannot occur.  The honest
+  counterpart, spelled out in Section~\ref{sec:where-used}, is that the
+  precision form is a normal-equations representation whose conditioning
+  degrades quadratically where square-root forms degrade linearly, and
+  which needs SPD $Q$ and $R$ (or explicit regularization).  For
+  well-posed batch smoothing problems --- the use cases of this note ---
+  the Cholesky route is robust and simple; for genuinely
+  ill-conditioned online problems the square-root literature retains
+  its documented advantages.
+\item \textbf{Modularity.}  Missing data, diffuse priors, irregular
+  sampling, partial observations, time-varying parameters, and
+  unobserved-components decompositions are all small edits to the
+  assembly of $J$ and $h$.  No need to redesign a recursion or
+  re-derive boundary conditions.
+\item \textbf{Extensibility.}  Robust losses (Laplace, Student-$t$),
+  sparsity priors, inequality constraints, and hierarchical extensions
+  all plug into the same sparse linear-algebra framework, typically via
+  iteratively reweighted solves on the same $J$.
+\item \textbf{Conceptual unification.}  The Hodrick--Prescott filter,
+  the Beveridge--Nelson decomposition, unobserved-components models,
+  factor models, and the textbook state-space problem are all
+  instances of a single object: a quadratic penalty on a latent path
+  solved by $J\widehat X=h$.  This unification is hard to see through
+  the recursive lens.
+\end{enumerate}
+
+What you do not gain is raw speed.  Sparse Cholesky on a
+block-tridiagonal SPD matrix \emph{is} the block-LDL$^\top$ recursion;
+CHOLMOD finds the natural ordering for free, because the time ordering
+is already optimal.  Both methods are $O(Tn^3)$ and the constants are
+comparable.  The point of the simultaneous form is not that it computes
+the answer faster.  It is that it computes the answer in a form the
+student can recognize as the answer.
+
+\section{Conclusion}
+
+The recursive Kalman filter and the RTS smoother are not separate
+theories.  They are the block-LDL$^\top$ forward sweep and the
+selected-inversion backward sweep of one sparse block-tridiagonal
+linear system,
+\begin{equation*}
+J\widehat X=h.
+\end{equation*}
+The reason this is not how they are usually taught is historical: the
+recursive form was forced on Kalman and his contemporaries by 1960s
+memory constraints and shaped by an engineering rather than an
+econometric tradition.  Neither constraint is ours.  For batch
+state-space estimation in modern macroeconomics, the simultaneous form
+is in the native idiom; numerically robust for well-posed problems with
+SPD precision, with none of the subtraction-induced failure modes of
+hand-coded recursions; modular under missing data and diffuse priors;
+easily extended to non-Gaussian errors and unobserved-components
+decompositions; and at least as efficient.
+Posterior covariances, marginal likelihood, and EM with smoothed
+sufficient statistics all follow from the same sparse solve.
+
+\clearpage
+\appendix
+
+\section*{License}
+\addcontentsline{toc}{section}{License}
+
+Copyright \copyright\ 2026 Mico Mrkaic.  The package is released under
+the GNU General Public License version~3 or later
+(\url{https://www.gnu.org/licenses/gpl-3.0.html}).  In plain
+terms: you may use, modify, and redistribute the code freely, including
+for commercial purposes, provided that derivative works are released
+under the same license with source code available.  Every source file
+in the package carries a short GPLv3 header pointing to the full
+license text in the \texttt{LICENSE} file at the package root.
+
+\section{Octave reference implementation}
+\label{sec:octave-impl}
+
+The reference implementation lives in \texttt{octave/simksmoother/}
+and is written in pure Octave (also runs on MATLAB).  It assembles
+$J$ and $h$ directly as sparse matrices via triplet arrays $(i,j,v)$
+with one terminal call to \texttt{sparse(i,j,v,N,N)}.  No matter which
+routine is invoked, the fundamental operation is one sparse solve:
+\begin{lstlisting}[language=Octave]
+Xvec = J \ h;
+\end{lstlisting}
+Octave's backslash dispatches to CHOLMOD when $J$ is sparse and SPD,
+so the cost is $O(Tn^3)$ in both flops and memory, just as in the
+recursive Kalman filter.
+
+\subsection{Calling conventions}
+
+All routines share the same calling style.  Required arguments
+(\texttt{Y}, \texttt{F}, \texttt{H}, \texttt{Q}, \texttt{R},
+\texttt{a0}, \texttt{P0}) come first; optional behaviour is controlled
+through an \texttt{opts} struct passed as the final argument.  Common
+fields:
+\begin{itemize}[leftmargin=2em,itemsep=2pt]
+\item \texttt{opts.Z}\ : $k\times T$ exogenous inputs.  Omit for none.
+\item \texttt{opts.B}\ : $n\times k$ state-side loading (default zeros).
+\item \texttt{opts.D}\ : $m\times k$ measurement-side loading (default zeros).
+\item \texttt{opts.return\_cov}\ : if \texttt{true}, also return posterior covariance blocks via selected inversion.
+\end{itemize}
+Diffuse priors are signalled by \texttt{P0 = []}.  Missing
+observations are \texttt{NaN} entries in \texttt{Y}; they are dropped
+from $\mathcal H^\top R^{-1}\mathcal H$ at the affected periods
+automatically.  The path \texttt{Xhat} returned by every routine is
+$n\times(T+1)$, with columns $\widehat x_{0\mid T},\ldots,
+\widehat x_{T\mid T}$.
+
+\subsection{Core smoothing and inference}
+
+\paragraph{\texttt{simks\_smooth\_const}.}  Basic constant-parameter
+smoother; the workhorse.
+\begin{lstlisting}[language=Octave]
+[Xhat, J, h, info] = simks_smooth_const(Y, F, H, Q, R, a0, P0, opts)
+\end{lstlisting}
+\emph{Inputs:} the seven required state-space arguments plus the
+optional \texttt{opts} struct.  \emph{Outputs:} the smoothed path
+\texttt{Xhat}; the sparse precision matrix \texttt{J}; the
+information vector \texttt{h}; and an \texttt{info} struct that
+always contains $n$, $m$, $T$ and the nonzero count of $J$, and
+additionally \texttt{Ptt}, \texttt{Ptt1} (cell arrays of diagonal and
+first-subdiagonal blocks of $J^{-1}$) when
+\texttt{opts.return\_cov=true}.
+
+\paragraph{\texttt{simks\_smooth\_tv}.}  Time-varying smoother.
+\begin{lstlisting}[language=Octave]
+[Xhat, J, h, info] = simks_smooth_tv(Y, Fseq, Hseq, Qseq, Rseq, a0, P0, opts)
+\end{lstlisting}
+Each of \texttt{Fseq}, \texttt{Hseq}, \texttt{Qseq}, \texttt{Rseq}
+may be a single constant matrix (replicated across all $t$) or a
+$1\times T$ cell array of per-period matrices; mixed usage is
+supported.  Outputs as in \texttt{simks\_smooth\_const}.
+
+\paragraph{\texttt{simks\_selected\_inv}.}  Takahashi selected inversion.
+\begin{lstlisting}[language=Octave]
+[Ptt, Ptt1, logdetJ] = simks_selected_inv(J, n)
+\end{lstlisting}
+\emph{Inputs:} the precision matrix \texttt{J} and the block size
+$n$.  \emph{Outputs:} the diagonal blocks $\Sigma_{tt}$ and the
+first-subdiagonal blocks $\Sigma_{t,t-1}$ of $J^{-1}$ as cell arrays,
+plus $\log\det J$ as a byproduct.  These are precisely the
+sufficient statistics the EM E-step needs.
+
+\paragraph{\texttt{simks\_marginal\_loglik}.}  Marginal log-likelihood.
+\begin{lstlisting}[language=Octave]
+[ll, parts] = simks_marginal_loglik(Y, F, H, Q, R, a0, P0, opts)
+\end{lstlisting}
+Returns the scalar marginal log-likelihood $\log p(Y;\theta)$ via the
+formula in Section~\ref{sec:loglik}.  The \texttt{parts} struct
+breaks out the prior, data, $\log\det J$, and normalizing
+contributions for diagnostics.
+
+\paragraph{\texttt{simks\_simulate\_const}.}  Forward simulation.
+\begin{lstlisting}[language=Octave]
+[Y, X] = simks_simulate_const(T, F, H, Q, R, a0, P0, opts)
+\end{lstlisting}
+\emph{Inputs:} the horizon $T$ and the state-space parameters.
+\emph{Outputs:} \texttt{Y} ($m\times T$) and \texttt{X}
+($n\times(T+1)$, columns $x_0,\ldots,x_T$).  Used by the demos and
+the test suite to generate ground-truth data.
+
+\paragraph{\texttt{simks\_rts\_reference}.}  Textbook Kalman + RTS.
+\begin{lstlisting}[language=Octave]
+[Xhat, P] = simks_rts_reference(Y, F, H, Q, R, a0, P0)
+\end{lstlisting}
+A clean recursive implementation, provided so that the reader can
+compare the recursive and simultaneous formulations line by line and
+confirm they compute the same object to machine precision.  No
+exogenous-input or missing-data handling --- it is the textbook
+algorithm in its simplest form.
+
+\subsection{Parameter estimation}
+
+\paragraph{\texttt{simks\_em\_const}.}  Gaussian EM.
+\begin{lstlisting}[language=Octave]
+[params, Xhat, hist] = simks_em_const(Y, n, opts)
+\end{lstlisting}
+\emph{Inputs:} the data \texttt{Y}, the latent state dimension $n$,
+and an \texttt{opts} struct that may carry initial parameter values,
+convergence controls, and exogenous inputs \texttt{Z}.
+\emph{Outputs:} the estimated parameter struct \texttt{params} with
+fields \texttt{F}, \texttt{H}, \texttt{Q}, \texttt{R}, \texttt{a0},
+\texttt{P0} (plus \texttt{B}, \texttt{D} if exogenous was supplied);
+the final smoothed path; and the history of the marginal
+log-likelihood across iterations.  The history is monotone
+non-decreasing by construction and is a useful sanity check.  All
+returned parameters, including \texttt{a0} and \texttt{P0}, are
+estimated: each iteration updates the initial-state pair by the
+single-observation M-step $\widehat a_0=\widehat x_{0\mid T}$ and
+$\widehat P_0=\Sigma_{00}$ documented in Section~\ref{sec:em}.
+
+\subsection{Beyond-Gaussian and constrained smoothing}
+
+\paragraph{\texttt{simks\_smooth\_robust}.}  Heavy-tailed IRLS smoother.
+\begin{lstlisting}[language=Octave]
+[Xhat, info] = simks_smooth_robust(Y, F, H, Q, R, a0, P0, family, opts)
+\end{lstlisting}
+\emph{Inputs:} the standard state-space arguments plus the
+\texttt{family} string and \texttt{opts}.  The family is one of
+\texttt{'gaussian'}, \texttt{'student-t'}, \texttt{'laplace'}, or
+\texttt{'huber'}.  The
+\texttt{opts} struct may carry \texttt{nu} (Student-$t$ degrees of
+freedom), \texttt{c} (Huber tuning constant), \texttt{robust\_state}
+(boolean, applies heavy tails to $w_t$ as well),
+\texttt{exact\_estep} (boolean, Student-$t$ only: replaces plug-in
+IRLS with the covariance-corrected E-step of
+Section~\ref{sec:robust}), and the usual exogenous fields.
+\emph{Outputs:} the smoothed path and an \texttt{info} struct that
+always contains \texttt{tau\_v}
+(per-period measurement weights at convergence), and additionally
+\texttt{tau\_w} when \texttt{robust\_state} is \texttt{true}.
+Weights much below $1$ flag outliers or structural breaks.
+
+\paragraph{\texttt{simks\_smooth\_slds}.}  Switching dynamics.
+\begin{lstlisting}[language=Octave]
+[Xhat, info] = simks_smooth_slds(Y, F_set, H, Q_set, R, a0, P0, opts)
+\end{lstlisting}
+Variational EM (exact coordinate updates, Section~\ref{sec:slds})
+for the switching linear dynamical system.  \emph{Inputs:}
+\texttt{F\_set} and \texttt{Q\_set} are $1\times K$ cell arrays of
+per-regime matrices; \texttt{opts.A} is the $K\times K$
+regime-transition matrix; with exogenous inputs, the per-regime state
+loadings are passed as \texttt{opts.B\_set}, a $1\times K$ cell
+array of $n\times k$ matrices (defaulting to zeros), alongside the
+common \texttt{opts.Z} and the regime-invariant \texttt{opts.D} ---
+note that the \texttt{opts.B} field of \texttt{simks\_smooth\_const}
+is \emph{not} used here, precisely because the loading is
+regime-dependent.  The remaining arguments are as in
+\texttt{simks\_smooth\_const}.  \emph{Outputs:} the smoothed state
+path; \texttt{info.pi}, a $K\times T$ matrix of regime
+responsibilities $\pi_{t,k}$; and \texttt{info.Ptt},
+\texttt{info.Ptt1}, the posterior covariance blocks of $q(X)$ at
+convergence (used internally by the expected-log-likelihood regime
+update and returned for convenience).
+
+\paragraph{\texttt{simks\_smooth\_constrained}.}  Inequality-constrained smoother.
+\begin{lstlisting}[language=Octave]
+[Xhat, info] = simks_smooth_constrained(Y, F, H, Q, R, a0, P0, A_ineq, b_ineq, opts)
+\end{lstlisting}
+\emph{Inputs:} the standard state-space arguments plus the constraint
+data $A_{\text{ineq}}$ (sparse, $c\times(T+1)n$) and $b_{\text{ineq}}$
+(length $c$).  \emph{Outputs:} the constrained smoothed path
+\texttt{Xhat} and an \texttt{info} struct containing the active-set
+mask, the approximate KKT multipliers, and interior-point convergence
+diagnostics.
+
+\subsection{Demos}
+
+The \texttt{octave/examples/} directory contains eleven demos
+exercising every routine and feature of the package.  Every demo
+prints numerical diagnostics to the console and produces a figure
+showing the relevant smoothed trajectories, posterior bands, IRLS
+weights, or regime probabilities.  Figures are simultaneously saved to
+\texttt{octave/examples/figures/} and displayed on screen.  The three
+worked applications in Appendix~\ref{sec:apps} produce figures in
+the same way.  The driver script \texttt{demo\_main.m} presents an
+interactive menu and runs demos individually or in sequence:
+\begin{lstlisting}[language=Octave]
+cd octave/examples
+demo_main
+\end{lstlisting}
+The demos are:
+\begin{itemize}[leftmargin=2em,itemsep=2pt]
+\item \texttt{demo\_const\_known}: smoothing with known parameters; posterior bands and empirical coverage check on a 2D state.
+\item \texttt{demo\_tv\_known}: time-varying parameters via the cell-array interface; a sinusoidally varying $F_t$ illustrates the API.
+\item \texttt{demo\_compare\_recursive}: simultaneous smoother vs textbook Kalman + RTS, agreement to $\sim 10^{-15}$.
+\item \texttt{demo\_missing}: NaN observations dropped automatically; posterior variance grows inside the gap.
+\item \texttt{demo\_hp\_filter}: the HP filter as a special case, matching the closed-form $(I+\lambda D_2^\top D_2)^{-1}y$ to within boundary effects.
+\item \texttt{demo\_const\_em}: EM with smoothed sufficient statistics; verifies that the marginal log-likelihood is monotone non-decreasing.
+\item \texttt{demo\_robust}: 10\% of observations contaminated with extra noise; Student-$t$ and Huber cut RMSE by roughly 40~percent.
+\item \texttt{demo\_robust\_breaks}: structural-break detection via state-side robust prior; three injected level shifts identified at $\xi_t<0.02$.
+\item \texttt{demo\_hp\_credit}: flagship demo on an HP filter with a credit-cycle exogenous driver, breaks, and outliers; compares Gaussian smoothing, Student-$t$ robust smoothing at true parameters, and Gaussian EM for unknown $(F,H,Q,R,B,D)$ as separate estimators (see Section~\ref{sec:em}).
+\item \texttt{demo\_slds}: two-regime AR(1); exact variational EM recovers regime probabilities at $\sim 90\%$ classification accuracy.  This demo uses a portable random-number generator so Octave, MATLAB, and Python simulate identical data and report identical results.
+\item \texttt{demo\_constrained}: NAIRU-style non-negativity constraint via interior-point QP; constraint exactly satisfied while the unconstrained smoother goes negative in 31 of 120 periods.
+\end{itemize}
+The three worked applications of Appendix~\ref{sec:apps} are also
+implemented as runnable scripts, with filenames \texttt{app$k$\_*.m},
+in the \texttt{applications/} subdirectory of
+\texttt{octave/examples/}.
+
+\section{Python implementation}
+\label{sec:python-impl}
+
+The \texttt{python/} directory contains a direct port of the Octave
+implementation to Python, packaged as \texttt{simksmoother}.  The
+mathematics is identical to the Octave version; only surface
+conventions differ.
+
+\subsection{Installation}
+
+The recommended setup is the standard editable install:
+\begin{lstlisting}
+cd python
+pip install -e .
+\end{lstlisting}
+Requires Python 3.9 or later, NumPy 1.20+, and SciPy 1.7+, plus
+\texttt{matplotlib} for the demo figures.  Optional:
+\texttt{scikit-sparse} (CHOLMOD bindings) for faster sparse
+factorization on large problems.
+
+The demos and worked applications also run without
+\texttt{pip install -e .}\ by adding the \texttt{python/} directory
+to \texttt{sys.path} themselves when they detect that
+\texttt{simksmoother} is not yet importable.  This lets users explore
+the package straight from a freshly unzipped copy of the repository
+(e.g.\ via IPython's \texttt{run demo\_const\_known} from inside
+\texttt{python/examples/}).
+
+\subsection{Calling conventions}
+
+Functions are imported from the top-level package:
+\begin{lstlisting}[language=Python]
+import simksmoother as sks
+\end{lstlisting}
+Required arguments come first; options are passed as keyword
+arguments rather than an \texttt{opts} struct.  \texttt{Z},
+\texttt{B}, \texttt{D} keyword arguments carry exogenous inputs.
+Diffuse priors are signalled by \texttt{P0=None} (instead of Octave's
+\texttt{P0=[]}).  Missing observations are \texttt{np.nan} entries in
+\texttt{Y}.  Returned arrays use the NumPy convention: rows are
+state coordinates, columns are time.  Note the indexing offset
+relative to Octave: column \texttt{t} of \texttt{Xhat} corresponds
+to $x_t$ ($t = 0,1,\ldots,T$), not column \texttt{t+1}.
+
+\subsection{Core smoothing and inference}
+
+\paragraph{\texttt{smooth\_const}.}  Basic smoother.
+\begin{lstlisting}[language=Python]
+Xhat, J, h, info = sks.smooth_const(
+    Y, F, H, Q, R, a0, P0,
+    Z=None, B=None, D=None, return_cov=False)
+\end{lstlisting}
+\emph{Inputs:} the seven required state-space arguments; optional
+exogenous inputs \texttt{Z}, \texttt{B}, \texttt{D}; flag
+\texttt{return\_cov}.  \emph{Outputs:} the smoothed path
+\texttt{Xhat} ($n\times(T+1)$ NumPy array), the SciPy sparse
+precision matrix \texttt{J} (CSC format), the information vector
+\texttt{h}, and \texttt{info} (a Python dict).  With
+\texttt{return\_cov=True}, \texttt{info} contains
+\texttt{Ptt} and \texttt{Ptt1}, lists of NumPy arrays for the
+diagonal and first-subdiagonal blocks of $J^{-1}$.
+
+\paragraph{\texttt{smooth\_tv}.}  Time-varying smoother.
+\begin{lstlisting}[language=Python]
+Xhat, J, h, info = sks.smooth_tv(
+    Y, Fseq, Hseq, Qseq, Rseq, a0, P0,
+    Z=None, Bseq=None, Dseq=None, return_cov=False)
+\end{lstlisting}
+Each of \texttt{Fseq}, \texttt{Hseq}, \texttt{Qseq}, \texttt{Rseq}
+may be either a single NumPy array (constant) or a length-$T$ list
+of arrays (per-period).
+
+\paragraph{\texttt{selected\_inv}.}  Selected inversion.
+\begin{lstlisting}[language=Python]
+Ptt, Ptt1 = sks.selected_inv(J, n)
+\end{lstlisting}
+\emph{Inputs:} the sparse precision matrix \texttt{J} and the block
+size $n$.  \emph{Outputs:} Python lists of $(n,n)$ NumPy arrays for
+the diagonal blocks (length $T+1$) and the first-subdiagonal blocks
+(length $T$) of $J^{-1}$.
+
+\paragraph{\texttt{marginal\_loglik}.}  Marginal log-likelihood.
+\begin{lstlisting}[language=Python]
+ll, parts = sks.marginal_loglik(
+    Y, F, H, Q, R, a0, P0, Z=None, B=None, D=None)
+\end{lstlisting}
+\emph{Outputs:} the scalar log-likelihood \texttt{ll} and a dict
+\texttt{parts} with the diagnostic breakdown.
+
+\paragraph{\texttt{simulate\_const}.}  Forward simulation.
+\begin{lstlisting}[language=Python]
+Y, X = sks.simulate_const(
+    T, F, H, Q, R, a0, P0,
+    Z=None, B=None, D=None, rng=None)
+\end{lstlisting}
+Uses the modern \texttt{numpy.random.Generator} API; pass an
+\texttt{rng} for reproducibility or accept the default.
+
+\paragraph{\texttt{rts\_smoother}.}  Reference Kalman + RTS.
+\begin{lstlisting}[language=Python]
+Xhat, P = sks.rts_smoother(Y, F, H, Q, R, a0, P0)
+\end{lstlisting}
+
+\subsection{Parameter estimation}
+
+\paragraph{\texttt{em\_const}.}  Gaussian EM.
+\begin{lstlisting}[language=Python]
+params, Xhat, hist = sks.em_const(
+    Y, n, max_iter=200, tol=1e-6,
+    F=None, H=None, Q=None, R=None, a0=None, P0=None,
+    Z=None, B=None, D=None, verbose=False)
+\end{lstlisting}
+\emph{Inputs:} the data and the state dimension $n$; optional
+initializations and convergence controls; optional exogenous inputs.
+\emph{Outputs:} \texttt{params} (dict with keys \texttt{F},
+\texttt{H}, \texttt{Q}, \texttt{R}, \texttt{a0}, \texttt{P0}, and
+\texttt{B}, \texttt{D} if exogenous was supplied), the final smoothed
+path, and a list of marginal log-likelihood values across iterations
+(monotone non-decreasing).
+
+\subsection{Beyond-Gaussian and constrained smoothing}
+
+\paragraph{\texttt{smooth\_robust}.}  Heavy-tailed IRLS smoother.
+\begin{lstlisting}[language=Python]
+Xhat, info = sks.smooth_robust(
+    Y, F, H, Q, R, a0, P0, family,
+    nu=4.0, c=1.345, robust_state=False,
+    exact_estep=False,
+    max_iter=50, tol=1e-6,
+    Z=None, B=None, D=None)
+\end{lstlisting}
+\texttt{family} is one of \texttt{"gaussian"}, \texttt{"student-t"},
+\texttt{"laplace"}, \texttt{"huber"}.  By default the weights are
+plug-in IRLS (the fixed point is the posterior mode);
+\texttt{exact\_estep=True} (Student-$t$ only) switches to the
+covariance-corrected E-step of Section~\ref{sec:robust}.
+\texttt{info} contains the final per-period weight vector
+\texttt{tau\_v} (and \texttt{tau\_w} when
+\texttt{robust\_state=True}); weights much below $1$ flag outliers or
+structural breaks.
+
+\paragraph{\texttt{smooth\_slds}.}  Switching dynamics.
+\begin{lstlisting}[language=Python]
+Xhat, info = sks.smooth_slds(
+    Y, F_set, H, Q_set, R, a0, P0,
+    A=None, pi0=None, Z=None, B_set=None, D=None,
+    max_iter=30, tol=1e-5)
+\end{lstlisting}
+\texttt{F\_set} and \texttt{Q\_set} are length-$K$ lists of NumPy
+arrays; regime-dependent state loadings go in \texttt{B\_set}
+(length-$K$ list of $n\times k$ arrays) alongside the common
+\texttt{Z} and the regime-invariant \texttt{D}.  The routine
+implements the exact variational coordinate updates of
+Section~\ref{sec:slds}.  \texttt{info["pi"]} is the $K\times T$
+regime-responsibility matrix at convergence;
+\texttt{info["Ptt"]} and \texttt{info["Ptt1"]} are the posterior
+covariance blocks of $q(X)$.
+
+\paragraph{\texttt{smooth\_constrained}.}  Inequality-constrained smoother.
+\begin{lstlisting}[language=Python]
+Xhat, info = sks.smooth_constrained(
+    Y, F, H, Q, R, a0, P0,
+    A_ineq, b_ineq,
+    Z=None, B=None, D=None)
+\end{lstlisting}
+\texttt{A\_ineq} should be a SciPy sparse matrix or a dense array of
+shape $(c, (T+1)n)$; \texttt{b\_ineq} is a length-$c$ array.
+\texttt{info} contains the active-set mask, approximate KKT
+multipliers, and interior-point convergence diagnostics.
+
+\subsection{Demos and tests}
+
+The same eleven demos as the Octave package are provided in
+\texttt{python/examples/}, with filenames \texttt{demo\_*.py}
+matching the Octave counterparts one-for-one.  Like their Octave
+counterparts, the Python demos print numerical diagnostics and
+produce \texttt{matplotlib} figures illustrating the same
+quantities.  Figures are simultaneously saved to
+\texttt{python/examples/figures/} and displayed on screen when a
+GUI backend is available; on headless systems the demos fall back
+to the non-interactive Agg backend silently.  The three worked
+applications of Appendix~\ref{sec:apps} produce figures in the
+same way.  Run any demo individually, or use the interactive menu:
+\begin{lstlisting}
+cd python/examples
+python demo_main.py
+\end{lstlisting}
+Given identical inputs, the Python and Octave/MATLAB core routines
+agree to floating-point precision (for example, on the shared
+\texttt{demo\_slds} data the smoothed paths agree to $\sim 10^{-16}$
+and the regime responsibilities to $\sim 10^{-15}$).  Note, however,
+that most demos draw their simulated data from each language's
+\emph{native} random-number generator, so their printed numbers differ
+across languages while telling the same qualitative story;
+\texttt{demo\_slds} is the exception, using a portable generator so
+that all environments produce identical output.  The headline numbers
+quoted in this note are from the Python runs.  The three worked
+applications of
+Appendix~\ref{sec:apps} are likewise implemented as
+\texttt{app$k$\_*.py} in the \texttt{applications/} subdirectory of
+\texttt{python/examples/}.
+
+A small test suite verifies the Python implementation:
+\begin{lstlisting}
+cd python
+python tests/test_all_demos.py
+\end{lstlisting}
+Five tests are run: simultaneous-vs-RTS agreement to $\sim 10^{-13}$;
+selected inversion vs dense inverse; exogenous-consistency
+($B = D = 0$ reproduces the no-exogenous solution); EM marginal
+log-likelihood is monotone non-decreasing across iterations; and all
+eleven demos run without error.
+
+\section{Three worked applications}
+\label{sec:apps}
+
+The appendix walks through three end-to-end applications, each of
+which is a recognizable workhorse in applied macroeconomic work.  The
+purpose is not to introduce new theory --- everything follows from
+the machinery developed in Sections \ref{sec:precision-form} through
+\ref{sec:constrained} --- but to show, by repeated example, that the
+machinery handles substantively different problems with the same tools.
+
+Each application is implemented as a runnable script in both Octave
+and Python, in the directories
+\texttt{octave/examples/applications/} and
+\texttt{python/examples/}\allowbreak\texttt{applications/}, with filenames
+\texttt{app$k$\_*.m} and \texttt{app$k$\_*.py} respectively.  Running
+them reproduces the numbers reported here.
+
+\subsection{Natural rate of interest}
+\label{sec:apps-rstar}
+
+The first application is the natural rate of interest $r^*_t$, the
+real short rate consistent with output at its trend.  Following
+\citet{LaubachWilliams2003} and \citet{HolstonLaubachWilliams2017}
+(``HLW''), we estimate $r^*_t$ jointly with trend output $y^*_t$
+and trend growth $g_t$, using a small structural state-space model.
+
+\paragraph{Model.}  Three latent objects evolve as random walks: trend
+output $y^*_t$, trend growth $g_t$, and an AR(2) output gap
+$\widetilde y_t$.  The natural rate is tied to trend growth through
+\begin{equation}
+r^*_t = c\,g_t,
+\end{equation}
+the ``Laubach--Williams identification'' --- a cross-equation
+restriction that pins down what would otherwise be an
+unidentified latent path.  The state and measurement equations are
+\begin{align}
+y^*_t &= y^*_{t-1}+g_{t-1}+\varepsilon^{y^*}_t,
+   &\varepsilon^{y^*}_t&\sim N(0,\sigma_{y^*}^2),\\
+g_t &= g_{t-1}+\varepsilon^g_t,
+   &\varepsilon^g_t&\sim N(0,\sigma_g^2),\\
+\widetilde y_t &= a_1\widetilde y_{t-1}+a_2\widetilde y_{t-2}
+                 +\frac{a_r}{2}\sum_{j=1}^{2}\bigl(r_{t-j}-r^*_{t-j}\bigr)
+                 +\varepsilon^{\widetilde y}_t,\\
+y_t&=y^*_t+\widetilde y_t,\\
+\pi_t - b_\pi\pi_{t-1}-(1-b_\pi)\bar\pi &= b_y\widetilde y_{t-1}+v_t.
+\end{align}
+The IS curve uses the standard HLW timing: the real-rate \emph{gap}
+enters as the average of its first two lags, so with
+$r^*_t=c\,g_t$ the equation expands to
+\begin{equation}
+\widetilde y_t = a_1\widetilde y_{t-1}+a_2\widetilde y_{t-2}
+   +\frac{a_r}{2}\bigl(r_{t-1}+r_{t-2}\bigr)
+   -\frac{a_r c}{2}\bigl(g_{t-1}+g_{t-2}\bigr)
+   +\varepsilon^{\widetilde y}_t :
+\end{equation}
+the observed policy-rate average enters as an exogenous input, and the
+natural-rate average appears as a state-side loading of $-a_r c/2$ on
+\emph{each} of $g_{t-1}$ and $g_{t-2}$ --- a single normalization used
+consistently in the equations, the transition matrix below, and the
+package code.  The inflation equation is implemented in
+quasi-differenced form: the left-hand side
+$\pi_t-b_\pi\pi_{t-1}-(1-b_\pi)\bar\pi$ is the observable fed to the
+smoother (so lagged inflation never needs to live in the state), and
+its loading $b_y$ on $\widetilde y_{t-1}$ is what identifies the
+Phillips slope.
+
+\paragraph{State-space mapping.}  Augmenting the state to carry the
+necessary lags gives
+\begin{equation}
+x_t=(y^*_t,\ g_t,\ g_{t-1},\ \widetilde y_t,\ \widetilde y_{t-1})^\top\in\mathbb R^5.
+\end{equation}
+In $x_{t-1}=(y^*_{t-1},\,g_{t-1},\,g_{t-2},\,\widetilde y_{t-1},\,
+\widetilde y_{t-2})^\top$, trend growth $g_{t-1}$ is the second
+component and $g_{t-2}$ the third, so both lags the IS curve needs are
+already in the state.  Reading the equations off row by row, the
+transition matrix is
+\begin{equation}
+F=\begin{pmatrix}
+1 & 1 & 0 & 0 & 0\\
+0 & 1 & 0 & 0 & 0\\
+0 & 1 & 0 & 0 & 0\\
+0 & -\tfrac{a_r c}{2} & -\tfrac{a_r c}{2} & a_1 & a_2\\
+0 & 0 & 0 & 1 & 0
+\end{pmatrix},
+\quad B=\begin{pmatrix}0\\0\\0\\a_r\\0\end{pmatrix},
+\end{equation}
+with exogenous regressor $z_t=\tfrac12(r_{t-1}+r_{t-2})$: the first
+row implements $y^*_t=y^*_{t-1}+g_{t-1}$ (the loading sits on the
+second component of $x_{t-1}$, i.e.\ $g_{t-1}$, matching the equation's
+timing), and the fourth row carries the two $-a_r c/2$ loadings on
+$g_{t-1}$ and $g_{t-2}$.  $Q$ is diagonal with \emph{three}
+substantive innovation variances ---
+$\sigma_{y^*}^2$, $\sigma_g^2$, and $\sigma_{\widetilde y}^2$ ---
+plus tiny regularizers on the two deterministic lag-shift components
+(rows three and five carry no shock of their own); the inflation
+disturbance $v_t$ is a \emph{measurement} shock and lives in $R$, not
+$Q$.  The observation matrix has output loading on $y^*$ and
+$\widetilde y$ and a quasi-differenced-inflation row that picks up
+$b_y\widetilde y_{t-1}$.
+
+\paragraph{Identification.}  Three issues are worth flagging:
+\begin{itemize}[leftmargin=2em]
+\item The IS-curve slope $a_r$ is famously near zero on
+  postwar US data \citep{HolstonLaubachWilliams2017}, which causes a
+  pile-up problem on $\sigma_g$ when both are estimated.  The
+  simultaneous form does not resolve this --- it is a fundamental
+  identification limitation --- but it makes the source visible: the
+  EM-estimated likelihood becomes nearly flat in a direction of
+  parameter space.
+\item Diffuse initialization on $y^*$ and $g$ is required (the
+  random-walk trend has no proper stationary distribution).  This is
+  the $P_0=\infty$ case treated in Section \ref{sec:diffuse}: the
+  prior block of $J$ is dropped.
+\item As an illustration of constrained smoothing, we impose
+  $r^*_t\ge 0$ on the smoothed path: $-c\,g_t\le 0$ for all $t$,
+  plugged into the QP framework of Section~\ref{sec:constrained} with
+  one row of $A_{\text{ineq}}$ per period.  One clarification on the
+  economics: this is a \emph{maintained restriction on the natural
+  rate}, not the zero lower bound --- the ZLB constrains the
+  \emph{nominal policy rate} $i_t$, while the natural real rate
+  $r^*_t$ can perfectly well be negative in the model (and in the
+  simulation below the true $r^*$ sometimes is).  A researcher might
+  still maintain $r^*\ge 0$ as a structural prior for a particular
+  economy; the point of the exercise is to show how cheaply such a
+  restriction is imposed, and (below) what happens when it is wrong.
+\end{itemize}
+
+\paragraph{Results on simulated data.}  On 200 quarters of data
+generated from the model with $\sigma_g=0.08$ (large enough that
+the true $r^*$ visits negative values), the demo reports:
+
+\begin{itemize}[leftmargin=2em]
+\item Estimator A (Gaussian smoother, true parameters):
+  RMSE on $g_t$ is 0.23; the posterior standard deviation of $r^*$
+  at the end of sample is 0.25, roughly 1.5 times its full-sample
+  average of 0.17.  This is the well-known result that $r^*$ is more
+  precisely identified \emph{inside} the sample than at the latest
+  date, where only one-sided information is available.
+\item Estimator B (constrained smoother): the unconstrained
+  estimator places $r^*$ below zero in 37 of 200 quarters; the
+  constrained estimator pins $r^*\ge 0$ to machine precision.
+  In this particular Monte Carlo draw the true $r^*$ is itself
+  negative in 27 quarters, so the maintained restriction contradicts
+  the data-generating process and (mildly) \emph{hurts} RMSE.  This is
+  the right diagnostic: an inequality constraint is informative only
+  when it reflects truth.  On samples where the true $r^*$ stays
+  non-negative (a more plausible empirical setting in some advanced
+  economies), the constraint improves accuracy.
+\item Estimator C (EM, all parameters unknown):  the EM-estimated $y^*$
+  correlates with the true $y^*$ at $\sim 0.99$, with monotone
+  marginal log-likelihood across iterations.  Identification of the
+  latent dynamics rotation is not perfect --- $F$ in the unrestricted
+  EM is not unique, only its action on the data --- but the
+  decomposition into trend and cycle is well-recovered.
+\end{itemize}
+
+The point of this application is that the same three pieces of
+machinery developed earlier in the note --- the basic smoother
+(Section~\ref{sec:precision-form}), constrained smoothing
+(Section~\ref{sec:constrained}), and EM with exogenous inputs
+(Section~\ref{sec:em}) --- combine without modification to deliver a
+full HLW-style analysis.  No bespoke "natural-rate code" is needed.
+
+\subsection{Nowcasting current-quarter GDP}
+\label{sec:apps-nowcast}
+
+The second application is a mixed-frequency dynamic factor model for
+nowcasting current-quarter GDP from monthly indicators.  This is the
+workhorse setup at central banks and IMF country desks; the canonical
+reference is \citet{MarianoMurasawa2003}, with extensions to large
+panels by \citet{GiannoneReichlinSmall2008} and
+\citet{BanburaModugno2014}.
+
+\paragraph{Model.}  A single latent monthly factor $f_t$ drives all
+indicators:
+\begin{align}
+f_t&=\phi\,f_{t-1}+e_t,\quad e_t\sim N(0,\sigma_e^2),\\
+y_{k,t}&=\lambda_k\,f_t+u_{k,t},\quad u_{k,t}\sim N(0,R_{kk}),\quad k=1,\ldots,K.
+\end{align}
+Quarterly GDP enters as a third-month aggregate: at the end of each
+quarter,
+\begin{equation}
+\text{GDP}_t=\lambda_g\cdot\tfrac13(f_t+f_{t-1}+f_{t-2})+u^{\text{GDP}}_t,
+\end{equation}
+and is unobserved (\texttt{NaN}) at all other monthly time stamps.
+
+\paragraph{State augmentation.}  The third-month average requires the
+state to carry two lags of the factor:
+$x_t=(f_t,f_{t-1},f_{t-2})^\top$, so $n=3$.  The observation matrix has
+$K$ rows for the monthly indicators (each loading on the first
+component only) and one row for GDP:
+\begin{equation}
+H=\begin{pmatrix}
+\lambda_1 & 0 & 0\\
+\vdots & \vdots & \vdots\\
+\lambda_K & 0 & 0\\
+\lambda_g/3 & \lambda_g/3 & \lambda_g/3
+\end{pmatrix}.
+\end{equation}
+
+\paragraph{Jagged edge.}  At any real-time vintage, the data panel
+has a ``jagged edge'': different indicators have different
+publication lags (industrial production typically lags by 1 month,
+employment by 1 month, retail sales by 1-2 months, GDP by 1-2
+quarters), so the last several observations are missing for some
+series and present for others.  In the simultaneous formulation this
+is just a pattern of NaN entries; the smoother handles them by
+dropping rows of $H'R^{-1}H$ at each affected $t$.  No bespoke
+"missing-data" code is needed.
+
+\paragraph{Real-time nowcast experiment.}  At the end of each
+of the three months of a quarter, we re-run the smoother on the
+data available at that vintage and read off the current-quarter
+nowcast as the smoothed average of the factor over the three
+months.  The posterior variance of this average is
+\begin{equation}
+\Var(\widehat{\text{GDP}})=\lambda_g^2\cdot\tfrac19\,\mathbf 1^\top\Sigma_3\,\mathbf 1,
+\end{equation}
+where $\Sigma_3$ is the $3\times 3$ posterior covariance of the
+three factor values over the quarter --- and here the state
+augmentation pays a small dividend.  Because the augmented state at
+the end-of-quarter month $t_3$ is
+$x_{t_3}=(f_{t_3},f_{t_3-1},f_{t_3-2})^\top$, $\Sigma_3$ is the
+\emph{single} diagonal block $\Sigma_{t_3 t_3}$ delivered by the
+Takahashi recursion of Section~\ref{sec:selinv}; its off-diagonal
+\emph{elements} already contain all three cross-month covariances,
+including the lag-two term $\Cov(f_{t_3},f_{t_3-2}\mid Y)$.  No
+off-diagonal time blocks of $J^{-1}$ are needed for this formula
+(assembling $\Sigma_3$ from the scalar factor at three separate times
+would require them, and dropping the lag-two cross term --- which is
+positive for a persistent factor --- would understate the nowcast
+variance).
+
+\paragraph{Results on simulated data.}  On 10 years of monthly
+data with $K=5$ indicators (release lags $[0,1,1,0,0]$) and one
+quarterly GDP series, the nowcast standard deviation shrinks from
+0.36 with one month of data to 0.21 with two months to 0.12 at the
+end of the quarter.  The factor itself is recovered with 0.96
+correlation against truth despite the missing-data pattern.
+Nowcast point estimates fall within one standard deviation of the
+true value at every vintage.
+
+The point of this application is the modularity claim from
+Section~\ref{sec:missing}: jagged edges, mixed frequencies, and
+publication lags are all the same thing --- patterns of missing
+observations --- and the simultaneous smoother handles them with no
+special-case code.  The posterior covariance from selected inversion
+gives the calibrated nowcast standard error as a free byproduct.
+
+\subsection{Semi-structural three-equation New Keynesian model}
+\label{sec:apps-nk}
+
+The third application is the workhorse three-equation New Keynesian
+model used for semi-structural projections in policy institutions
+(see \citet{BergKaramLaxton2006} for the IMF reference
+implementation).  Three equations link the output gap, inflation,
+and the policy rate:
+\begin{align}
+\widetilde y_t &= \alpha_1\widetilde y_{t-1}+\alpha_2(i_{t-1}-\pi_{t-1}-\bar r)+\varepsilon^{y}_t,\\
+\pi_t &= \beta_1\pi_{t-1}+(1-\beta_1)\bar\pi+\beta_2\widetilde y_{t-1}+\varepsilon^{\pi}_t,\\
+i_t &= \rho_i i_{t-1}+(1-\rho_i)\bigl[\bar r+\bar\pi+\phi_\pi(\pi_{t-1}-\bar\pi)+\phi_y\widetilde y_{t-1}\bigr]+\varepsilon^{i}_t.
+\end{align}
+The structural slopes $(\beta_2,\alpha_2,\phi_\pi,\phi_y)$ are the
+empirically interesting parameters; the structural shocks
+$(\varepsilon^y,\varepsilon^\pi,\varepsilon^i)$ are demand,
+cost-push, and monetary shocks, the bread and butter of policy
+narratives.
+
+\paragraph{State-space mapping.}  The state $x_t=(\widetilde y_t,\pi_t,i_t)$
+contains everything an observer needs.  All forward
+expectations have been replaced by their backward-looking reduced
+form; the system is purely autoregressive with three innovations.
+The $F$ matrix is
+\begin{equation}
+F=\begin{pmatrix}
+\alpha_1 & -\alpha_2 & \alpha_2\\
+\beta_2 & \beta_1 & 0\\
+(1-\rho_i)\phi_y & (1-\rho_i)\phi_\pi & \rho_i
+\end{pmatrix},
+\quad
+B=\begin{pmatrix}
+-\alpha_2\bar r\\
+(1-\beta_1)\bar\pi\\
+(1-\rho_i)(\bar r+\bar\pi-\phi_\pi\bar\pi)
+\end{pmatrix},
+\end{equation}
+with the exogenous regressor $z_t=1$ carrying the constants.
+Observation is direct: $y_t=x_t+v_t$, with measurement error.
+
+\paragraph{Shock decomposition.}  Given smoothed states $\widehat X$,
+the smoothed structural shocks fall out:
+\begin{equation}
+\widehat\varepsilon_t=\widehat x_t-F\widehat x_{t-1}-B z_t.
+\end{equation}
+These are the central-bank-narrative quantities: "how much of last
+quarter's output gap was demand vs monetary?"  The simultaneous
+smoother delivers them in one sparse solve.
+
+\paragraph{Results on simulated data.}  On 200 quarters of simulated
+data with conventional calibration ($\beta_2=0.15$, $\rho_i=0.80$,
+$\phi_\pi=1.50$, $\phi_y=0.50$):
+
+\begin{itemize}[leftmargin=2em]
+\item The Gaussian smoother with true parameters recovers all three
+  structural shocks with correlations of $0.90$, $0.99$, and $0.97$
+  against truth, respectively (demand, cost-push, monetary).
+\item EM with all parameters unknown converges in $\sim 120$
+  iterations with monotone marginal log-likelihood.  The Phillips
+  slope $\beta_2$ (i.e.\ $\kappa$, the canonical hard parameter) is
+  recovered at $0.17$ vs.\ a truth of $0.15$.  The Taylor-rule
+  coefficients are noticeably less precise ($\phi_\pi$ at $1.87$
+  vs.\ truth $1.50$), a well-known consequence of the limited
+  variation in policy-rate movements available in the simulated
+  sample: with the smoothing parameter $\rho_i=0.80$, the
+  systematic part of the rule contributes little independent
+  variation, and the likelihood is correspondingly flat in
+  $(\phi_\pi,\phi_y)$.
+\end{itemize}
+
+No DSGE-specific estimation routine is involved.  The state-space
+formulation plus the standard EM algorithm of Section~\ref{sec:em}
+delivers structural identification, shock decomposition, and
+posterior bands on the latent gaps on the same sparse $J$ that the
+basic smoother used.
+
+\subsection{What the three applications have in common}
+
+The point of the three together is conceptual unity.  Each
+application defines $(F,H,Q,R,B,D)$ for a substantively different
+economic problem.  Each produces a substantively different output:
+$r^*$ at the latest date, current-quarter GDP, structural shock
+decomposition.  Each exercises a different optional capability of
+the framework: constrained smoothing, missing data, EM on a
+multi-equation system.  But the core machinery is identical.  The
+work-horse object in every case is the same sparse block-tridiagonal
+linear system $JX=h$, solved once or iterated as part of EM, with
+the same selected-inversion machinery for posterior covariances.
+This is what is meant by ``the right idiom'' for state-space modelling
+in macroeconometrics.
+
+\begin{thebibliography}{Lange et~al.(1989)}
+
+\bibitem[Andrews and Mallows(1974)]{AndrewsMallows1974}
+Andrews, D.\ F., and C.\ L.\ Mallows (1974).
+``Scale mixtures of normal distributions.''
+\emph{Journal of the Royal Statistical Society, Series B},
+36(1):99--102.
+
+\bibitem[Banbura and Modugno(2014)]{BanburaModugno2014}
+Banbura, M., and M.\ Modugno (2014).
+``Maximum likelihood estimation of factor models on datasets with
+arbitrary pattern of missing data.''
+\emph{Journal of Applied Econometrics}, 29(1):133--160.
+
+\bibitem[Berg, Karam, and Laxton(2006)]{BergKaramLaxton2006}
+Berg, A., P.\ Karam, and D.\ Laxton (2006).
+``Practical model-based monetary policy analysis: a how-to guide.''
+\emph{IMF Working Paper} WP/06/80.
+
+\bibitem[Bierman(1977)]{Bierman1977}
+Bierman, G.\ J.\ (1977).
+\emph{Factorization Methods for Discrete Sequential Estimation}.
+Academic Press, New York.
+
+\bibitem[Botev(2017)]{Botev2017}
+Botev, Z.\ I.\ (2017).
+``The normal law under linear restrictions: simulation and estimation
+via minimax tilting.''
+\emph{Journal of the Royal Statistical Society, Series B},
+79(1):125--148.
+
+\bibitem[Carpenter et~al.(2017)]{Carpenter2017}
+Carpenter, B., A.\ Gelman, M.\ D.\ Hoffman, D.\ Lee, B.\ Goodrich,
+M.\ Betancourt, M.\ Brubaker, J.\ Guo, P.\ Li, and A.\ Riddell (2017).
+``Stan: a probabilistic programming language.''
+\emph{Journal of Statistical Software}, 76(1):1--32.
+
+\bibitem[Chan and Jeliazkov(2009)]{ChanJeliazkov2009}
+Chan, J.\ C.\ C., and I.\ Jeliazkov (2009).
+``Efficient simulation and integrated likelihood estimation in state
+space models.''
+\emph{International Journal of Mathematical Modelling and Numerical
+Optimisation}, 1:101--120.
+
+\bibitem[Davis(2006)]{Davis2006}
+Davis, T.\ A.\ (2006).
+\emph{Direct Methods for Sparse Linear Systems}.
+SIAM.
+
+\bibitem[de Jong(1991)]{deJong1989}
+de Jong, P.\ (1991).
+``The diffuse Kalman filter.''
+\emph{Annals of Statistics}, 19(2):1073--1083.
+
+\bibitem[Durbin and Koopman(2012)]{DurbinKoopman2012}
+Durbin, J., and S.\ J.\ Koopman (2012).
+\emph{Time Series Analysis by State Space Methods}, 2nd ed.
+Oxford University Press.
+
+\bibitem[Erisman and Tinney(1975)]{ErismanTinney1975}
+Erisman, A.\ M., and W.\ F.\ Tinney (1975).
+``On computing certain elements of the inverse of a sparse matrix.''
+\emph{Communications of the ACM}, 18(3):177--179.
+
+\bibitem[Ghahramani and Hinton(2000)]{GhahramaniHinton2000}
+Ghahramani, Z., and G.\ E.\ Hinton (2000).
+``Variational learning for switching state-space models.''
+\emph{Neural Computation}, 12(4):831--864.
+
+\bibitem[Giannone, Reichlin, and Small(2008)]{GiannoneReichlinSmall2008}
+Giannone, D., L.\ Reichlin, and D.\ Small (2008).
+``Nowcasting: the real-time informational content of macroeconomic
+data.''
+\emph{Journal of Monetary Economics}, 55(4):665--676.
+
+\bibitem[Giannone, Lenza, and Primiceri(2015)]{GiannoneLenzaPrimiceri2015}
+Giannone, D., M.\ Lenza, and G.\ E.\ Primiceri (2015).
+``Prior selection for vector autoregressions.''
+\emph{Review of Economics and Statistics}, 97(2):436--451.
+
+\bibitem[Holland and Welsch(1977)]{HollandWelsch1977}
+Holland, P.\ W., and R.\ E.\ Welsch (1977).
+``Robust regression using iteratively reweighted least-squares.''
+\emph{Communications in Statistics: Theory and Methods}, 6(9):813--827.
+
+\bibitem[Holston, Laubach, and Williams(2017)]{HolstonLaubachWilliams2017}
+Holston, K., T.\ Laubach, and J.\ C.\ Williams (2017).
+``Measuring the natural rate of interest: international trends and
+determinants.''
+\emph{Journal of International Economics}, 108(S1):S59--S75.
+
+\bibitem[Kalman(1960)]{Kalman1960}
+Kalman, R.\ E.\ (1960).
+``A new approach to linear filtering and prediction problems.''
+\emph{Journal of Basic Engineering}, 82(D):35--45.
+
+\bibitem[Koopman and Durbin(2003)]{KoopmanDurbin2003}
+Koopman, S.\ J., and J.\ Durbin (2003).
+``Filtering and smoothing of state vector for diffuse state space
+models.''
+\emph{Journal of Time Series Analysis}, 24:85--98.
+
+\bibitem[Lange et~al.(1989)]{LangeLittleTaylor1989}
+Lange, K.\ L., R.\ J.\ A.\ Little, and J.\ M.\ G.\ Taylor (1989).
+``Robust statistical modeling using the $t$-distribution.''
+\emph{Journal of the American Statistical Association},
+84(408):881--896.
+
+\bibitem[Laubach and Williams(2003)]{LaubachWilliams2003}
+Laubach, T., and J.\ C.\ Williams (2003).
+``Measuring the natural rate of interest.''
+\emph{Review of Economics and Statistics}, 85(4):1063--1070.
+
+\bibitem[Mariano and Murasawa(2003)]{MarianoMurasawa2003}
+Mariano, R.\ S., and Y.\ Murasawa (2003).
+``A new coincident index of business cycles based on monthly and
+quarterly series.''
+\emph{Journal of Applied Econometrics}, 18(4):427--443.
+
+\bibitem[McCausland et~al.(2011)]{McCauslandMillerPelletier2011}
+McCausland, W.\ J., S.\ Miller, and D.\ Pelletier (2011).
+``Simulation smoothing for state-space models: A computational
+efficiency analysis.''
+\emph{Computational Statistics \& Data Analysis}, 55(1):199--212.
+
+\bibitem[Rauch et~al.(1965)]{RTS1965}
+Rauch, H.\ E., F.\ Tung, and C.\ T.\ Striebel (1965).
+``Maximum likelihood estimates of linear dynamic systems.''
+\emph{AIAA Journal}, 3(8):1445--1450.
+
+\bibitem[Roweis and Ghahramani(1999)]{RoweisGhahramani1999}
+Roweis, S., and Z.\ Ghahramani (1999).
+``A unifying review of linear Gaussian models.''
+\emph{Neural Computation}, 11(2):305--345.
+
+\bibitem[Rue and Held(2005)]{RueHeld2005}
+Rue, H., and L.\ Held (2005).
+\emph{Gaussian Markov Random Fields: Theory and Applications}.
+Chapman \& Hall/CRC.
+
+\bibitem[Rue, Martino, and Chopin(2009)]{RueMartinoChopin2009}
+Rue, H., S.\ Martino, and N.\ Chopin (2009).
+``Approximate Bayesian inference for latent Gaussian models by using
+integrated nested Laplace approximations.''
+\emph{Journal of the Royal Statistical Society, Series B},
+71(2):319--392.
+
+\bibitem[Shumway and Stoffer(1982)]{ShumwayStoffer1982}
+Shumway, R.\ H., and D.\ S.\ Stoffer (1982).
+``An approach to time series smoothing and forecasting using the EM
+algorithm.''
+\emph{Journal of Time Series Analysis}, 3(4):253--264.
+
+\bibitem[Takahashi et~al.(1973)]{TakahashiFaganChen1973}
+Takahashi, K., J.\ Fagan, and M.\ Chen (1973).
+``Formation of a sparse bus impedance matrix and its application to
+short circuit study.''
+\emph{Proc.\ 8th PICA Conference}, pp.\ 63--69.  Minneapolis.
+
+\bibitem[Watson and Engle(1983)]{Watson1983}
+Watson, M.\ W., and R.\ F.\ Engle (1983).
+``Alternative algorithms for the estimation of dynamic factor,
+MIMIC and varying coefficient regression models.''
+\emph{Journal of Econometrics}, 23(3):385--400.
+
+\end{thebibliography}
+
+\end{document}
