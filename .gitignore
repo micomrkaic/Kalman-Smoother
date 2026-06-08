@@ -1,0 +1,7 @@
+examples/figures/
+octave/examples/figures/
+python/examples/figures/
+*.png
+octave-workspace
+__pycache__/
+.Rhistory
