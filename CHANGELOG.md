@@ -1,5 +1,30 @@
 # Changelog
 
+## v3.1 (June 2026)
+
+Performance release for the Octave/MATLAB implementation; no numerical
+changes.
+
+- `simks_smooth_const.m` and `simks_smooth_tv.m` previously assembled
+  the sparse precision matrix by calling a nested `add_block` helper
+  (with an `ndgrid` per block) roughly five times per period.  In
+  Octave/MATLAB this per-call interpreter overhead on tiny n x n blocks
+  dominated total runtime.  The assembly is now vectorized: all triplet
+  indices are built with implicit expansion and a single `sparse()`
+  call; `smooth_tv` keeps only the unavoidable per-period loop for the
+  time-varying matrix inverses, writing into preallocated value arrays.
+- Measured on T = 400, n = 2: `simks_smooth_const` 0.70 s -> 0.002 s
+  per call; `simks_smooth_tv` 0.62 s -> 0.05 s; Gaussian EM 1.45 s ->
+  0.07 s per iteration.  The full eleven-demo suite now runs in about
+  20 s of compute (previously `demo_hp_credit`'s 80 EM iterations alone
+  took about two minutes).
+- Outputs are bit-identical to v3 (verified against the previous
+  implementation on plain, exogenous, missing-data, diffuse, and
+  time-varying paths: max |dX| = max |dJ| = max |dh| = 0), and the
+  cross-language demo_slds agreement with Python is unchanged.
+- The Python implementation already used one-shot triplet assembly and
+  is unchanged.
+
 ## v3 (June 2026)
 
 Revision responding to a full external peer review (20 numbered comments

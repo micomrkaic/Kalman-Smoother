@@ -87,40 +87,39 @@ function [Xhat, J, h, info] = simks_smooth_tv(Y, Fseq, Hseq, Qseq, Rseq, a0, P0,
   N = (T+1)*n;
   idx = @(t) (t*n+1):((t+1)*n);
 
-  cap = (T+1)*n*n + 2*T*n*n + n*n;
-  ii  = zeros(cap,1);
-  jj  = zeros(cap,1);
-  vv  = zeros(cap,1);
-  ptr = 0;
+  % Triplet assembly.  Indices for all blocks are precomputed with
+  % implicit expansion; the per-period loops only fill value columns of
+  % preallocated arrays (matrix inverses must be computed per period
+  % anyway).  An earlier version called a nested add_block helper with
+  % ndgrid per block; in Octave/MATLAB that per-call overhead dominated
+  % runtime for small n.
+  [bi, bj] = ndgrid(1:n, 1:n);
+  bi = bi(:);  bj = bj(:);             % n^2 x 1 within-block offsets
+  off = n * (0:T-1);                   % 1 x T
 
-  function add_block(rows, cols, M)
-    [Ri_, Cj_] = ndgrid(rows, cols);
-    k_ = numel(M);
-    ii(ptr+1:ptr+k_) = Ri_(:);
-    jj(ptr+1:ptr+k_) = Cj_(:);
-    vv(ptr+1:ptr+k_) = M(:);
-    ptr = ptr + k_;
-  end
+  V_dprev = zeros(n*n, T);             % F_t' Qti F_t   at (t-1, t-1)
+  V_dcur  = zeros(n*n, T);             % Qti            at (t,   t)
+  V_oUp   = zeros(n*n, T);             % -F_t' Qti      at (t-1, t)
+  V_oLo   = zeros(n*n, T);             % -Qti F_t       at (t,   t-1)
+  V_meas  = zeros(n*n, T);             % measurement information at (t, t)
 
   h = zeros(N, 1);
-
-  if ~diffuse
-    add_block(idx(0), idx(0), P0i);
-    h(idx(0)) = h(idx(0)) + P0i * a0;
-  end
 
   for t = 1:T
     Ft  = get_F(t);
     Qti = inv(get_Q(t));
-    add_block(idx(t-1), idx(t-1),  Ft' * Qti * Ft);
-    add_block(idx(t),   idx(t),    Qti);
-    add_block(idx(t-1), idx(t),   -Ft' * Qti);
-    add_block(idx(t),   idx(t-1), -Qti * Ft);
+    FtQti = Ft' * Qti;
+    V_dprev(:,t) = reshape(FtQti * Ft, [], 1);
+    V_dcur(:,t)  = Qti(:);
+    Mup          = -FtQti;
+    V_oUp(:,t)   = Mup(:);
+    Mlo          = -Qti * Ft;
+    V_oLo(:,t)   = Mlo(:);
 
     if have_exog
       Bz = get_B(t) * Z(:,t);
       h(idx(t)) = h(idx(t)) + Qti * Bz;
-      h(idx(t-1)) = h(idx(t-1)) + -Ft' * Qti * Bz;
+      h(idx(t-1)) = h(idx(t-1)) - FtQti * Bz;
     end
   end
 
@@ -136,17 +135,31 @@ function [Xhat, J, h, info] = simks_smooth_tv(Y, Fseq, Hseq, Qseq, Rseq, a0, P0,
     mask = ~isnan(yt);
     if all(mask)
       Rti = inv(Rt);
-      add_block(idx(t), idx(t), Ht' * Rti * Ht);
-      h(idx(t)) = h(idx(t)) + Ht' * Rti * ytilde;
+      HtRti = Ht' * Rti;
+      V_meas(:,t) = reshape(HtRti * Ht, [], 1);
+      h(idx(t)) = h(idx(t)) + HtRti * ytilde;
     elseif any(mask)
       Hm   = Ht(mask,:);
       Rm_i = inv(Rt(mask,mask));
-      add_block(idx(t), idx(t), Hm' * Rm_i * Hm);
-      h(idx(t)) = h(idx(t)) + Hm' * Rm_i * ytilde(mask);
+      HmRm = Hm' * Rm_i;
+      V_meas(:,t) = reshape(HmRm * Hm, [], 1);
+      h(idx(t)) = h(idx(t)) + HmRm * ytilde(mask);
     end
+    % all-missing periods leave V_meas(:,t) at zero: no information.
   end
 
-  ii = ii(1:ptr); jj = jj(1:ptr); vv = vv(1:ptr);
+  rows_d  = bi + off;       cols_d  = bj + off;        % blocks (t-1, t-1)
+  rows_d1 = bi + n + off;   cols_d1 = bj + n + off;    % blocks (t,   t)
+
+  ii = [rows_d(:); rows_d1(:); rows_d(:);  rows_d1(:); rows_d1(:)];
+  jj = [cols_d(:); cols_d1(:); cols_d1(:); cols_d(:);  cols_d1(:)];
+  vv = [V_dprev(:); V_dcur(:); V_oUp(:);   V_oLo(:);   V_meas(:)];
+
+  if ~diffuse
+    ii = [ii; bi];  jj = [jj; bj];  vv = [vv; P0i(:)];
+    h(idx(0)) = h(idx(0)) + P0i * a0;
+  end
+
   J = sparse(ii, jj, vv, N, N);
   J = (J + J') / 2;
 

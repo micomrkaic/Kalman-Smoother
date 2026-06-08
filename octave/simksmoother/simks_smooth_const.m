@@ -115,82 +115,91 @@ function [Xhat, J, h, info] = simks_smooth_const(Y, F, H, Q, R, a0, P0, opts)
   idx = @(t) (t*n+1):((t+1)*n);    % t = 0,...,T
 
   % ----- assemble J by triplets ----------------------------------------------
-  % Worst-case nnz: (T+1) diag blocks of n^2 + 2T off-diag blocks of n^2.
-  cap = (T+1)*n*n + 2*T*n*n + n*n;     % a little slack
-  ii  = zeros(cap,1);
-  jj  = zeros(cap,1);
-  vv  = zeros(cap,1);
-  ptr = 0;
-
-  function add_block(rows, cols, M)
-    % Accumulate triplets for a dense block M into (rows, cols).
-    [Ri_, Cj_] = ndgrid(rows, cols);
-    k_ = numel(M);
-    ii(ptr+1:ptr+k_) = Ri_(:);
-    jj(ptr+1:ptr+k_) = Cj_(:);
-    vv(ptr+1:ptr+k_) = M(:);
-    ptr = ptr + k_;
-  end
-
-  h = zeros(N, 1);
-
-  % Prior on x_0.
-  if ~diffuse
-    add_block(idx(0), idx(0), P0i);
-    h(idx(0)) = h(idx(0)) + P0i * a0;
-  end
-
-  % Dynamics: each transition x_t = F x_{t-1} + B z_t + w_t contributes
-  %   F' Qi F at (t-1, t-1), Qi at (t,t), and -F' Qi / -Qi F off-diagonal.
-  % With exogenous input, h gains
-  %   h(idx(t))   += Qi * B z_t        (from the +B z_t side)
-  %   h(idx(t-1)) += -F' Qi * B z_t    (from the F x_{t-1} side)
+  % The assembly is fully vectorized: with constant (F, H, Q, R) the same
+  % four n x n dynamics blocks repeat at regularly spaced offsets, so all
+  % triplets are built with broadcasting and ONE call to sparse().
+  % (An earlier version looped over t calling a nested add_block helper;
+  % in Octave/MATLAB the per-call interpreter overhead on tiny blocks
+  % dominated total runtime by an order of magnitude.)
   FtQiF = F' * Qi * F;
   FtQi  = F' * Qi;
   QiF   = Qi  * F;
-  for t = 1:T
-    add_block(idx(t-1), idx(t-1),  FtQiF);
-    add_block(idx(t),   idx(t),    Qi);
-    add_block(idx(t-1), idx(t),   -FtQi);
-    add_block(idx(t),   idx(t-1), -QiF);
+  HtRiH_full = H' * Ri * H;
+  HtRi       = H' * Ri;
 
-    if have_exog
-      Bz = B * Z(:,t);
-      h(idx(t)) = h(idx(t)) + Qi * Bz;
-      h(idx(t-1)) = h(idx(t-1)) + -FtQi * Bz;
-    end
+  [bi, bj] = ndgrid(1:n, 1:n);
+  bi = bi(:);  bj = bj(:);             % n^2 x 1 within-block offsets
+  off  = n * (0:T-1);                  % 1 x T block offsets for t = 1..T
+  rows_d  = bi + off;                  % n^2 x T (implicit expansion)
+  cols_d  = bj + off;
+  rows_d1 = bi + n + off;              % shifted one block down/right
+  cols_d1 = bj + n + off;
+
+  % Dynamics: each transition x_t = F x_{t-1} + B z_t + w_t contributes
+  %   F' Qi F at (t-1, t-1), Qi at (t,t), and -F' Qi / -Qi F off-diagonal.
+  ii = [rows_d(:);  rows_d1(:); rows_d(:);  rows_d1(:)];
+  jj = [cols_d(:);  cols_d1(:); cols_d1(:); cols_d(:)];
+  vv = [repmat( FtQiF(:), T, 1);
+        repmat( Qi(:),    T, 1);
+        repmat(-FtQi(:),  T, 1);
+        repmat(-QiF(:),   T, 1)];
+
+  % Prior on x_0.
+  h = zeros(N, 1);
+  if ~diffuse
+    ii = [ii; bi];  jj = [jj; bj];  vv = [vv; P0i(:)];
+    h(idx(0)) = P0i * a0;
+  end
+
+  % Exogenous state forcing in h:
+  %   h(idx(t))   += Qi * B z_t        (from the +B z_t side)
+  %   h(idx(t-1)) += -F' Qi * B z_t    (from the F x_{t-1} side)
+  if have_exog
+    BZ = B * Z;                                        % n x T
+    h(n+1:end)   = h(n+1:end)   + reshape(Qi * BZ, [], 1);
+    h(1:end-n)   = h(1:end-n)   - reshape(FtQi * BZ, [], 1);
   end
 
   % Measurement: handle missing entries.  If row k of y_t is NaN, drop it.
   % With exogenous input D z_t, we replace y_t with the residual
-  %   ytilde_t = y_t - D z_t
-  % in the measurement contribution to h.
-  HtRiH_full = H' * Ri * H;
-  HtRi       = H' * Ri;
-  any_missing = any(isnan(Y(:)));
-  for t = 1:T
-    yt = Y(:,t);
-    if have_exog
-      ytilde = yt - D * Z(:,t);
-    else
-      ytilde = yt;
+  %   ytilde_t = y_t - D z_t.  Complete-data periods are vectorized; only
+  % periods with missing entries take the slow per-period path.
+  if have_exog
+    Ytilde = Y - D * Z;                                % m x T
+  else
+    Ytilde = Y;
+  end
+  miss_t = find(any(isnan(Y), 1));                     % periods with any NaN
+  full_t = 1:T;
+  full_t(miss_t) = [];
+
+  if ~isempty(full_t)
+    off_f  = n * full_t;                               % block offsets idx(t)
+    rows_m = bi + off_f;
+    cols_m = bj + off_f;
+    ii = [ii; rows_m(:)];
+    jj = [jj; cols_m(:)];
+    vv = [vv; repmat(HtRiH_full(:), numel(full_t), 1)];
+    hm   = HtRi * Ytilde(:, full_t);                   % n x numel(full_t)
+    hidx = (1:n)' + n * full_t;                        % n x numel(full_t)
+    h(hidx(:)) = h(hidx(:)) + hm(:);
+  end
+  for t = miss_t
+    yt   = Y(:,t);
+    mask = ~isnan(yt);
+    if any(mask)
+      Hm   = H(mask,:);
+      Rm_i = inv(R(mask,mask));
+      ytil = Ytilde(mask, t);
+      blk  = Hm' * Rm_i * Hm;
+      ii = [ii; bi + n*t];
+      jj = [jj; bj + n*t];
+      vv = [vv; blk(:)];
+      h(idx(t)) = h(idx(t)) + Hm' * Rm_i * ytil;
     end
-    if ~any_missing || all(~isnan(yt))
-      add_block(idx(t), idx(t), HtRiH_full);
-      h(idx(t)) = h(idx(t)) + HtRi * ytilde;
-    else
-      mask = ~isnan(yt);
-      if any(mask)
-        Hm   = H(mask,:);
-        Rm_i = inv(R(mask,mask));
-        add_block(idx(t), idx(t), Hm' * Rm_i * Hm);
-        h(idx(t)) = h(idx(t)) + Hm' * Rm_i * ytilde(mask);
-      end
-      % else: no information at time t; that period contributes nothing.
-    end
+    % else: no information at time t; that period contributes nothing.
   end
 
-  ii = ii(1:ptr);  jj = jj(1:ptr);  vv = vv(1:ptr);
   J = sparse(ii, jj, vv, N, N);   % duplicate (i,j) entries are summed.
   J = (J + J') / 2;               % enforce numerical symmetry.
 
